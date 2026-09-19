@@ -1,0 +1,329 @@
+{
+  "notice": "仅供契约联调的合成数据；不是真实文献、科研结论或已实现API响应。示例验证JSON形状，引用归属须由集成测试另验。",
+  "cases": [
+    {
+      "name": "创建项目请求",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/ProjectCreate",
+      "value": {
+        "title": "合成测试研究",
+        "research_question": "比较方法A和方法B的适用条件",
+        "output_language": "zh-CN"
+      }
+    },
+    {
+      "name": "202受理data",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/JobAccepted",
+      "value": {
+        "job_id": "22222222-2222-4222-8222-222222222222",
+        "resource_type": "analysis_run",
+        "resource_id": "33333333-3333-4333-8333-333333333333"
+      }
+    },
+    {
+      "name": "保存正文请求",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/RevisionCreate",
+      "value": {
+        "base_revision_number": 1,
+        "sections": [
+          {
+            "section_key": "background",
+            "title": "研究背景",
+            "blocks": [
+              {
+                "block_id": "66666666-6666-4666-8666-000000000001",
+                "kind": "claim",
+                "text": "合成测试论文比较方法A与方法B。",
+                "evidence_ids": [
+                  "55555555-5555-4555-8555-555555555555"
+                ]
+              }
+            ]
+          },
+          {
+            "section_key": "directions",
+            "title": "主要方向",
+            "blocks": [
+              {
+                "block_id": "66666666-6666-4666-8666-000000000002",
+                "kind": "claim",
+                "text": "合成测试论文比较方法A与方法B。",
+                "evidence_ids": [
+                  "55555555-5555-4555-8555-555555555555"
+                ]
+              }
+            ]
+          },
+          {
+            "section_key": "representative_work",
+            "title": "代表性工作",
+            "blocks": [
+              {
+                "block_id": "66666666-6666-4666-8666-000000000003",
+                "kind": "claim",
+                "text": "合成测试论文比较方法A与方法B。",
+                "evidence_ids": [
+                  "55555555-5555-4555-8555-555555555555"
+                ]
+              }
+            ]
+          },
+          {
+            "section_key": "disagreements",
+            "title": "学术争议",
+            "blocks": [
+              {
+                "block_id": "66666666-6666-4666-8666-000000000004",
+                "kind": "claim",
+                "text": "合成测试论文比较方法A与方法B。",
+                "evidence_ids": [
+                  "55555555-5555-4555-8555-555555555555"
+                ]
+              }
+            ]
+          },
+          {
+            "section_key": "trends",
+            "title": "发展趋势",
+            "blocks": [
+              {
+                "block_id": "66666666-6666-4666-8666-000000000005",
+                "kind": "claim",
+                "text": "合成测试论文比较方法A与方法B。",
+                "evidence_ids": [
+                  "55555555-5555-4555-8555-555555555555"
+                ]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "导出请求",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/ExportCreate",
+      "value": {
+        "revision_id": "77777777-7777-4777-8777-777777777777",
+        "validation_id": "88888888-8888-4888-8888-888888888888",
+        "acknowledge_warnings": true
+      }
+    },
+    {
+      "name": "模型逐页提取",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/PageExtract",
+      "value": {
+        "elements": [
+          {
+            "element_type": "text",
+            "text": "合成测试论文比较方法A与方法B。",
+            "section": "摘要"
+          }
+        ]
+      }
+    },
+    {
+      "name": "模型单篇要素",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/PaperExtract",
+      "value": {
+        "research_question": {
+          "value": "合成测试论文比较方法A与方法B。",
+          "evidence_ids": [
+            "55555555-5555-4555-8555-555555555555"
+          ]
+        },
+        "research_object": {
+          "value": null,
+          "evidence_ids": []
+        },
+        "methods": [
+          {
+            "value": "合成测试论文比较方法A与方法B。",
+            "evidence_ids": [
+              "55555555-5555-4555-8555-555555555555"
+            ]
+          }
+        ],
+        "datasets": [],
+        "metrics": [],
+        "conclusions": [
+          {
+            "value": "合成测试论文比较方法A与方法B。",
+            "evidence_ids": [
+              "55555555-5555-4555-8555-555555555555"
+            ]
+          }
+        ],
+        "limitations": [],
+        "summary": {
+          "value": "合成测试论文比较方法A与方法B。",
+          "evidence_ids": [
+            "55555555-5555-4555-8555-555555555555"
+          ]
+        }
+      }
+    },
+    {
+      "name": "模型查询扩展",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/QueryExpand",
+      "value": {
+        "queries": [
+          "方法A 方法B 适用条件"
+        ]
+      }
+    },
+    {
+      "name": "模型重排",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/Rerank",
+      "value": {
+        "results": [
+          {
+            "evidence_id": "55555555-5555-4555-8555-555555555555",
+            "score": 0.8,
+            "reason": "候选中有对应比较内容"
+          }
+        ]
+      }
+    },
+    {
+      "name": "模型主题",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/Topics",
+      "value": {
+        "topics": [
+          {
+            "name": "方法比较",
+            "description": "比较适用条件",
+            "paper_ids": [
+              "44444444-4444-4444-8444-444444444444"
+            ],
+            "evidence_ids": [
+              "55555555-5555-4555-8555-555555555555"
+            ]
+          }
+        ],
+        "unassigned_paper_ids": []
+      }
+    },
+    {
+      "name": "模型无争议",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/Disputes",
+      "value": {
+        "disputes": []
+      }
+    },
+    {
+      "name": "模型单节正文",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/ReviewSection",
+      "value": {
+        "section_key": "background",
+        "title": "研究背景",
+        "blocks": [
+          {
+            "kind": "claim",
+            "text": "合成测试论文比较方法A与方法B。",
+            "evidence_ids": [
+              "55555555-5555-4555-8555-555555555555"
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "模型核验",
+      "document": "../contracts/model_outputs.schema.json",
+      "schema": "#/$defs/VerifyBlocks",
+      "value": {
+        "blocks": [
+          {
+            "block_id": "66666666-6666-4666-8666-000000000001",
+            "structure_ok": true,
+            "support": "supported",
+            "issues": [],
+            "suggestion": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "历史分析快照",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/Run",
+      "value": {
+        "id": "33333333-3333-4333-8333-333333333333",
+        "project_id": "11111111-1111-4111-8111-111111111111",
+        "research_question": "冻结的合成测试问题：比较方法A和方法B",
+        "output_language": "zh-CN",
+        "status": "processing",
+        "job_id": "22222222-2222-4222-8222-222222222222",
+        "corpus_revision": 1,
+        "analysis_revision": 1,
+        "is_stale": false,
+        "created_at": "2026-09-19T00:00:00Z",
+        "papers": [
+          {
+            "paper_id": "44444444-4444-4444-8444-000000000001",
+            "title": "合成测试论文1",
+            "authors": [
+              "合成作者"
+            ],
+            "year": 2024,
+            "status": "pending",
+            "parsed_document_id": null,
+            "page_count": 5,
+            "error": null
+          },
+          {
+            "paper_id": "44444444-4444-4444-8444-000000000002",
+            "title": "合成测试论文2",
+            "authors": [
+              "合成作者"
+            ],
+            "year": 2024,
+            "status": "pending",
+            "parsed_document_id": null,
+            "page_count": 5,
+            "error": null
+          }
+        ],
+        "stats": {
+          "included_count": 2,
+          "ready_count": 0,
+          "failed_count": 0,
+          "year_counts": [
+            {
+              "year": 2024,
+              "count": 2
+            }
+          ],
+          "unknown_year_count": 0
+        },
+        "error": null
+      }
+    },
+    {
+      "name": "未完成导入账本",
+      "document": "../contracts/openapi.json",
+      "schema": "#/components/schemas/ImportBatchResult",
+      "value": {
+        "items": [
+          {
+            "requested_id": "2401.00001",
+            "resolved_source_id": "2401.00001v1",
+            "status": "pending",
+            "paper_id": null,
+            "error": null
+          }
+        ]
+      }
+    }
+  ]
+}

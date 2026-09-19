@@ -1,0 +1,44 @@
+# ── 凭据与本地环境 ──────────────────────────────────────────────
+# 真实 .env 绝不入库；只提交 .env.example
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*api key*.txt
+
+# ── Python ────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+
+# ── 私有存储：原文、页图、解析产物、检索索引、导出文件 ──────────
+# PRIVATE_STORAGE_ROOT 必须位于仓库之外；下面这些是本机开发回退目录
+.private/
+.data/
+*.sqlite3
+
+# ── 日志与临时文件 ────────────────────────────────────────────
+*.log
+logs/
+tmp/
+.celerybeat-schedule*
+
+# ── 前端 ──────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/test-results/
+
+# ── 编辑器与系统 ──────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

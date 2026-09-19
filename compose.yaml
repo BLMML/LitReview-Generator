@@ -1,0 +1,99 @@
+# 内部试用部署：Web / worker / 调度 / PostgreSQL / Redis / 前端反向代理
+#
+# 数据库与 Redis 不发布到公网；Web 与 worker 共享同一私有文件卷（PRIVATE_STORAGE_ROOT）。
+# 凭据一律来自同目录 .env，不烘焙进镜像。
+#
+# 启动：docker compose up -d --build
+# 首次：docker compose exec web python manage.py migrate
+#       docker compose exec web python manage.py createsuperuser
+
+name: review-mvp
+
+x-backend-env: &backend-env
+  env_file:
+    - .env
+  environment:
+    DATABASE_URL: postgresql://review:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/review_mvp
+    REDIS_URL: redis://redis:6379/0
+    PRIVATE_STORAGE_ROOT: /var/lib/review-mvp/private
+
+x-backend-volumes: &backend-volumes
+  - private-storage:/var/lib/review-mvp/private
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: review_mvp
+      POSTGRES_USER: review
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U review -d review_mvp"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    # 不映射到宿主端口：仅容器网络内可达
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  web:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120"]
+    environment:
+      <<: *backend-env
+      APP_ENV: production
+    volumes: *backend-volumes
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    # 并发与预取保持保守：正文逐节生成时不得出现未计入限制的并发调用
+    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--concurrency=2", "--prefetch-multiplier=1"]
+    environment: *backend-env
+    volumes: *backend-volumes
+    depends_on:
+      web:
+        condition: service_started
+
+  beat:
+    build:
+      context: .
+      dockerfile: deploy/backend.Dockerfile
+    restart: unless-stopped
+    # reconcile_jobs / cleanup_expired_artifacts 的定时入口
+    command: ["celery", "-A", "config", "beat", "--loglevel=INFO"]
+    environment: *backend-env
+    volumes: *backend-volumes
+    depends_on:
+      web:
+        condition: service_started
+
+  # 前端服务尚未创建：本次骨架只交付 Django 后端。
+  # frontend/ 与 deploy/frontend.Dockerfile、deploy/nginx.conf 落地后，
+  # 在此增加一个同域反向代理服务（静态资源 + /api 转发），
+  # 不要把 PRIVATE_STORAGE_ROOT 映射成公开静态目录。
+
+volumes:
+  pgdata:
+  private-storage:

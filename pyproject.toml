@@ -1,0 +1,73 @@
+[project]
+name = "review-mvp"
+version = "0.1.0"
+description = "学术文献综述智能生成系统 — MVP 后端（Django + DRF + DeepSeek）"
+readme = "README.md"
+# 基线冻结在 Python 3.12；见 docs/mvp/00_开发基线与范围.md 第 2 节
+requires-python = ">=3.12,<3.13"
+
+dependencies = [
+    "Django~=5.2",
+    "djangorestframework~=3.16",
+    "celery[redis]~=5.5",
+    "redis~=6.1",
+    "psycopg[binary]~=3.2",
+    # PDF 解析：文本层用 pypdf，复杂页渲染用 pypdfium2
+    "pypdf~=6.0",
+    "pypdfium2~=5.0",
+    # 首期检索：TF-IDF + 关键词；不接向量数据库
+    "scikit-learn~=1.7",
+    # arXiv 元数据与 PDF 下载
+    "httpx~=0.28",
+    # Word 导出
+    "python-docx~=1.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest~=8.4",
+    "pytest-django~=4.11",
+    "ruff~=0.14",
+]
+# 正式部署在 Linux 容器内使用
+prod = [
+    "gunicorn~=23.0",
+]
+
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+# 后端不是可安装包，源码由 manage.py / pytest 的 pythonpath 直接加载
+packages = []
+
+# ── 测试 ──────────────────────────────────────────────────────
+[tool.pytest.ini_options]
+DJANGO_SETTINGS_MODULE = "config.settings"
+# backend/ 必须在内，否则 apps.* 无法导入
+pythonpath = ["backend"]
+testpaths = ["backend/tests"]
+addopts = "-ra --strict-markers"
+
+# ── 静态检查 ──────────────────────────────────────────────────
+[tool.ruff]
+target-version = "py312"
+line-length = 110
+extend-exclude = [".venv", "backend/**/migrations"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "C4", "DJ", "S"]
+ignore = [
+    "S101",  # 允许测试里使用 assert
+    "B008",  # DRF/Django 惯用的函数调用默认值
+]
+
+[tool.ruff.lint.per-file-ignores]
+"backend/tests/**" = ["S105", "S106", "S311"]
+"backend/config/settings.py" = ["S105"]
+# 手工运行的端到端脚本：目标地址固定为本机 http://127.0.0.1:8000
+"backend/tests/*_http.py" = ["S310"]
+# docs/mvp/02 明确规定 source_id / provider_request_id / result 等字段可空，
+# 且空值语义与空字符串不同（部分唯一约束依赖 NULL）。此处按契约保留 null=True。
+"backend/apps/**/models.py" = ["DJ001"]
