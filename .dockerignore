@@ -1,0 +1,37 @@
+# 构建上下文排除项。
+# 没有这个文件时，docker build 会把整个 .venv/（数百 MB）和 .data/ 一起传给守护进程，
+# 既慢又可能把本地数据库与私有存储打进上下文。
+
+# 虚拟环境与本地运行产物
+.venv/
+venv/
+.data/
+.private/
+
+# 版本控制与工具缓存
+.git/
+.gitignore
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# Python 缓存
+**/__pycache__/
+**/*.py[cod]
+*.egg-info/
+
+# 凭据：绝不进入构建上下文（.env.example 是模板，保留）
+.env
+.env.*
+!.env.example
+
+# 日志与编辑器
+*.log
+logs/
+.vscode/
+.idea/
+.DS_Store
+
+# 前端依赖（镜像构建只复制 backend/ 与契约目录）
+node_modules/
+frontend/dist/

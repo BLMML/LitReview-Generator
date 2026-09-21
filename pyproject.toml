@@ -29,7 +29,9 @@ dev = [
     "pytest-django~=4.11",
     "ruff~=0.14",
 ]
-# 正式部署在 Linux 容器内使用
+# 正式部署在 Linux 容器内使用。
+# 注意：requirements.lock 是镜像实际安装的唯一来源，其中已包含 gunicorn。
+# 这个 extra 只声明意图与版本范围；改依赖时两者必须一起更新并重新生成锁文件。
 prod = [
     "gunicorn~=23.0",
 ]

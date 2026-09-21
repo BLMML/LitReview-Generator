@@ -20,13 +20,21 @@ RUN apt-get update \
 
 WORKDIR /app
 
-# 依赖层单独缓存：只有锁文件变化才重装
+# 依赖层单独缓存：只有锁文件变化才重装。
+# requirements.lock 是**部署完整集**，已包含 Linux 专用的 gunicorn
+# （对应 pyproject.toml 的 prod extra）。下面的 import 断言让镜像在
+# 锁文件缺 gunicorn 时立刻构建失败，而不是等到容器启动才报 command not found。
 COPY requirements.lock ./
-RUN python -m pip install --no-cache-dir -r requirements.lock
+RUN python -m pip install --no-cache-dir -r requirements.lock \
+ && python -c "import gunicorn; print('gunicorn', gunicorn.__version__)"
 
 # 源码层
 COPY backend/ ./backend/
 COPY docs/mvp/contracts/ ./backend/contracts/
+# pyproject.toml 带着 pytest 配置（pythonpath / DJANGO_SETTINGS_MODULE）。
+# 镜像里要能跑测试套件，才能在真实 PostgreSQL 上验证并发约束，
+# 而不是只靠 SQLite 的结论。
+COPY pyproject.toml ./
 
 # 私有存储卷挂载点；PRIVATE_STORAGE_ROOT 由编排注入
 RUN mkdir -p /var/lib/review-mvp/private \

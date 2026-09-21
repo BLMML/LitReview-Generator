@@ -29,6 +29,9 @@ dist/
 *.log
 logs/
 tmp/
+# Celery beat 的调度状态文件（两种命名都要覆盖）
+celerybeat-schedule*
+.celerybeat-schedule*
 .celerybeat-schedule*
 
 # ── 前端 ──────────────────────────────────────────────────────

@@ -205,6 +205,11 @@ def _postgres_from_url(url: str) -> dict[str, object]:
     )
     if query.get("sslmode"):
         options["sslmode"] = query["sslmode"]
+    # 连接超时：数据库没起来时快速失败并给出明确错误，
+    # 而不是让每个请求挂到操作系统的 TCP 超时（实测能到几分钟）。
+    options.setdefault(
+        "connect_timeout", env_int("DJANGO_DB_CONNECT_TIMEOUT", 5, minimum=1)
+    )
     return {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": unquote(parsed.path.lstrip("/")),
@@ -252,11 +257,16 @@ AUTH_PASSWORD_VALIDATORS = [
 
 SESSION_COOKIE_HTTPONLY = True
 SESSION_COOKIE_SAMESITE = "Lax"
-SESSION_COOKIE_SECURE = IS_PRODUCTION
 # 前端从 GET /auth/csrf 读取 token；cookie 仍设为可被同源脚本读取，便于调试
 CSRF_COOKIE_HTTPONLY = False
 CSRF_COOKIE_SAMESITE = "Lax"
-CSRF_COOKIE_SECURE = IS_PRODUCTION
+
+# Secure cookie 默认跟随 APP_ENV：production → true，development / test → false。
+# 未接 TLS 的内部试用阶段必须显式关掉：纯 HTTP 下 Secure cookie 不会被客户端回传，
+# 登录会直接失败。见 .env.example 与 compose.yaml 的 DJANGO_SECURE_COOKIES。
+SECURE_COOKIES = env_bool("DJANGO_SECURE_COOKIES", default=IS_PRODUCTION)
+SESSION_COOKIE_SECURE = SECURE_COOKIES
+CSRF_COOKIE_SECURE = SECURE_COOKIES
 
 if IS_PRODUCTION:
     SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")

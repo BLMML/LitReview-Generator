@@ -59,10 +59,57 @@ celery -A config beat   -l INFO      # 定时恢复扫描（另开终端）
 本机没有 PostgreSQL 时，`development` 会回退到 `.data/db.sqlite3` 并在启动时打印警告；
 `test` 与 `production` 不回退。SQLite 足以跑契约与权限测试，但不能替代并发结论。
 
+因此 `.env` 里的 `DATABASE_URL` **默认留空**。装了 PostgreSQL 之后再填上，
+否则本地测试会因为连不上库而报错（连接超时由 `DJANGO_DB_CONNECT_TIMEOUT` 控制，默认 5 秒）。
+
 ### Redis 与 Celery
 
 `REDIS_URL` 只做队列与临时协调。**任务真实状态永远在数据库**：
 投递失败保留 `queued` 由 `reconcile_jobs` 补发，不以队列 ACK 推导成功。
+
+### 容器方式（内部试用）
+
+前置：**Docker Desktop**（Windows 上用 WSL2 后端）。需要管理员权限，通常要重启一次。
+装好后确认 `docker version` 打印的是**服务端**版本，而不只是客户端版本。
+
+`.env` 已经生成（含随机的 `DJANGO_SECRET_KEY` 与 `POSTGRES_PASSWORD`，均不入库）。
+
+**一键验证整套环境**（推荐先跑这个）：
+
+```bash
+python deploy/verify_stack.py
+```
+
+它会依次验证：Compose 渲染结果、镜像构建、db/redis 健康、Django 确实连的是 PostgreSQL、
+迁移可从空库应用、模型与迁移文件一致、能 ping 通 Redis、worker 就绪、beat 启动、
+投递的任务真的被 worker 执行、**容器内用真实 PostgreSQL 跑完整测试套件**，
+最后从宿主机跑 HTTP 冒烟与业务走查。加 `--down` 可在验证后自动停栈。
+
+手动分步：
+
+```bash
+docker compose up -d --build
+docker compose exec web python manage.py migrate
+docker compose exec web python manage.py createsuperuser
+docker compose ps                      # 确认 db / redis 都是 healthy
+docker compose logs -f worker          # 看 worker 是否连上 Redis
+```
+
+容器里 `APP_ENV=production`、`DJANGO_DEBUG=false` 由 `compose.yaml` 强制注入，
+不跟随本地 `.env` 的开发设置。数据库与 Redis **不发布到宿主机**，
+Web 目前只绑定 `127.0.0.1:8000`（前端与 nginx 尚未创建）。
+
+⚠ **`DJANGO_SECURE_COOKIES`**：接入 HTTPS 之前必须保持 `false`。
+Secure cookie 在纯 HTTP 下不会被浏览器或客户端回传，会导致登录直接失败。
+`compose.yaml` 里默认已是 `false` 并附了说明；接上 nginx / TLS 后改成 `true`，
+或删掉那一行让 settings 按 `APP_ENV=production` 自动取 `true`。
+
+没有 Docker 时，可以先用静态校验器挡住"配置写错、一跑就崩"这类问题：
+
+```bash
+python .data/tools/validate_deploy.py       # 56 项：锚点结构、暴露面、变量引用、gunicorn
+python .data/tools/check_prod_settings.py   # 用容器那套变量驱动 Django 配置
+```
 
 ---
 
@@ -92,7 +139,15 @@ ruff check backend                   # 静态检查
 python manage.py check               # Django 系统检查
 ```
 
-当前状态：**24 passed, 47 skipped**。
+当前状态（`DATABASE_URL` 指向 PostgreSQL 时）：**41 passed, 47 skipped**。
+未设置 `DATABASE_URL` 时会回退 SQLite，`tests/test_postgres_constraints.py`
+的 **17 项整组跳过**，只剩 24 passed —— 这是刻意的：那 17 项断言的是
+行锁、部分唯一索引和并发受理，SQLite 不提供这些语义，跑出来的「通过」没有意义。
+
+```bash
+# 只看 PostgreSQL 专有的并发与约束断言
+python -m pytest tests/test_postgres_constraints.py -v
+```
 
 跳过的 47 条不是通过，而是把 docs/mvp/01 第 9 节要求的验收行为先写成显式 skip，
 避免把“没实现”伪装成“已通过”。实现对应阶段后逐条打开即可。
@@ -217,15 +272,63 @@ python backend/tests/walkthrough_http.py
 2. **系统临时目录不可写**，因此 `pip` 的 `TEMP`/`TMP` 指向了 `.data/tmp`。
    同理，pytest 夹具把私有存储根目录建在 `.data/test-storage/` 而不是 `tmp_path`。
 
-此外，本机**没有 Docker、PostgreSQL 与 Redis**，因此：
+此外，本机**没有 Docker**，WSL 虽存在但未安装任何发行版。因此改用免安装版本地跑：
 
-- `compose.yaml` 与 `deploy/backend.Dockerfile` 已按 docs/mvp/01 第 8 节写好，
-  但**未经实际构建与启动验证**；
-- 迁移是在 SQLite 上跑通的，**尚未在 PostgreSQL 上验证**；
-- Celery worker / beat 未实机启动过。
+| 组件 | 位置 | 说明 |
+| --- | --- | --- |
+| PostgreSQL 17.9 | `C:\Users\Public\review-mvp-pg` | 免安装二进制 + 数据目录，只监听 127.0.0.1:5432 |
+| Redis 5.0.14 | `.data/redis` | Windows 移植版，只监听 127.0.0.1:6379，**关闭持久化** |
 
-这三项必须在有 Docker 的机器上补做，属于 docs/mvp/01 第 9 节要求的运行验证，
-不能由文档检查代替。
+管理命令（**必须在你自己的终端跑，不要在受限沙箱里跑**）：
+
+```powershell
+.venv\Scripts\python.exe .data\tools\pg_ctl_local.py init|start|stop|status
+.venv\Scripts\python.exe .data\tools\redis_local.py   start|stop|status
+
+# 换到别的盘（例如 D 盘）
+.venv\Scripts\python.exe .data\tools\pg_ctl_local.py init --root D:\review-mvp-pg
+```
+
+`init` 会自动把二进制迁到 ASCII 路径、初始化集群、建库建角色并把 `DATABASE_URL`
+写进 `.env`。写完 `.env` 后本地测试自动从 SQLite 切到 PostgreSQL，代码无需改动。
+
+已验证（2026-09-21）：迁移在 PostgreSQL 上从空库全部应用；
+**41 passed / 47 skipped**，其中 17 项是 PostgreSQL 专有的并发与约束断言；
+Redis 连通；worker 消费投递的任务；beat 每 30 秒触发 `reconcile_jobs` 并被 worker 执行。
+
+仍未验证：`compose.yaml` 与 `deploy/backend.Dockerfile` 只过了 56 项静态检查，
+**没有真实 build / up 过**。等有 Docker 的机器上用 `python deploy/verify_stack.py` 补做。
+
+### ⚠️ PostgreSQL 装在含中文的路径下会失败（BUG #16926）
+
+这是本机踩过的坑，值得记住：**Windows 上 PostgreSQL 的安装路径不能含非 ASCII 字符**。
+
+initdb 后期自举时会生成一条 `COPY` 命令，把「安装目录下 `share/sql_features.txt`
+的完整路径」写进 SQL，而服务器要求这条 SQL 是合法 UTF8。路径里只要有中文
+（例如用户名 `别浪慢慢来`），字节序列就不是 UTF8：
+
+```
+performing post-bootstrap initialization ...
+FATAL:  invalid byte sequence for encoding "UTF8": 0xb1
+```
+
+核心开发者已明确表示不会修（[BUG #16926](https://www.postgresql.org/message-id/16926-e4ef345545d185ab%40postgresql.org)）。
+注意这条报错**极易误导**：它看起来像编码或 locale 问题，但 `--locale=C`、`-E UTF8`
+都改不动它，真正的变量是路径。数据目录也一并放在 ASCII 路径下更保险。
+
+`.data/tools/pg_ctl_local.py` 已经内置了这个处理：检测到安装路径非 ASCII 时
+自动复制 `bin`/`lib`/`share` 到 `<root>\pgsql` 再初始化。
+
+### 相对 docs/mvp/01 第 8.1 节新增的环境变量
+
+以下变量是在实现部署配置时补的，需要回填进 01 的变量清单：
+
+| 变量 | 用途 |
+| --- | --- |
+| `POSTGRES_PASSWORD` | 仅 compose 使用；会被拼进 `postgresql://` 连接串，必须 URL 安全 |
+| `DJANGO_SECURE_COOKIES` | 留空跟随 `APP_ENV`；未接 TLS 时显式设 `false`，否则纯 HTTP 下登录失败 |
+| `DJANGO_DB_CONNECT_TIMEOUT` | 数据库连接超时秒数，默认 5；避免连不上时挂到系统 TCP 超时 |
+| `DJANGO_DB_CONN_MAX_AGE` | 数据库连接复用秒数，默认 60 |
 
 ---
 

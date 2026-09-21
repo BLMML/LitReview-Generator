@@ -1,24 +1,54 @@
-# 内部试用部署：Web / worker / 调度 / PostgreSQL / Redis / 前端反向代理
+# 内部试用部署：Web / worker / 调度 / PostgreSQL / Redis
 #
-# 数据库与 Redis 不发布到公网；Web 与 worker 共享同一私有文件卷（PRIVATE_STORAGE_ROOT）。
+# 数据库与 Redis 不发布到宿主机；Web 与 worker 共享同一私有文件卷（PRIVATE_STORAGE_ROOT）。
 # 凭据一律来自同目录 .env，不烘焙进镜像。
 #
 # 启动：docker compose up -d --build
 # 首次：docker compose exec web python manage.py migrate
 #       docker compose exec web python manage.py createsuperuser
+# 自检：docker compose ps
+#       docker compose logs -f worker
 
 name: review-mvp
 
-x-backend-env: &backend-env
-  env_file:
-    - .env
-  environment:
-    DATABASE_URL: postgresql://review:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@db:5432/review_mvp
-    REDIS_URL: redis://redis:6379/0
-    PRIVATE_STORAGE_ROOT: /var/lib/review-mvp/private
+# ── 公共环境变量映射 ──────────────────────────────────────────
+# 这是「键值对」锚点，只能合并进 environment，或直接整体赋给 environment。
+# 不要把 env_file 一起塞进这个锚点：那样 environment 里会多出 env_file /
+# environment 两个键，Compose 会当成两个畸形环境变量而拒绝启动。
+x-backend-environment: &backend-environment
+  # 容器内始终按正式模式运行，不跟随本地开发用的 .env
+  APP_ENV: production
+  DJANGO_DEBUG: "false"
+  # ⚠ 未接 nginx / TLS 之前必须为 false：Secure cookie 在纯 HTTP 下不会被客户端
+  #   回传，浏览器会直接登录失败。接入 HTTPS 后设为 true，或删掉这一行让
+  #   settings 按 APP_ENV=production 自动取 true。
+  DJANGO_SECURE_COOKIES: ${DJANGO_SECURE_COOKIES:-false}
+  # 显式主机名列表，不使用 *。容器内可用 web 互访。
+  DJANGO_ALLOWED_HOSTS: ${DJANGO_ALLOWED_HOSTS:-localhost,127.0.0.1,web}
+  # 密码必须是 URL 安全字符：它会被拼进下面的连接串（见 .env.example）
+  DATABASE_URL: postgresql://review:${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}@db:5432/review_mvp
+  REDIS_URL: redis://redis:6379/0
+  PRIVATE_STORAGE_ROOT: /var/lib/review-mvp/private
 
 x-backend-volumes: &backend-volumes
   - private-storage:/var/lib/review-mvp/private
+
+# 三个后端服务共用的构建、重启策略、环境文件与卷
+x-backend-base: &backend-base
+  build:
+    context: .
+    dockerfile: deploy/backend.Dockerfile
+  restart: unless-stopped
+  env_file:
+    - .env
+  volumes: *backend-volumes
+
+# Web / worker / beat 共用的依赖顺序：数据库与 Redis 都健康后再启动
+x-backend-depends: &backend-depends
+  db:
+    condition: service_healthy
+  redis:
+    condition: service_healthy
 
 services:
   db:
@@ -27,7 +57,7 @@ services:
     environment:
       POSTGRES_DB: review_mvp
       POSTGRES_USER: review
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请在 .env 中设置 POSTGRES_PASSWORD}
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -35,64 +65,65 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
-    # 不映射到宿主端口：仅容器网络内可达
+    # 不映射到宿主机端口：仅容器网络内可达
 
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # 只做队列与临时协调，不做持久化：任务真实状态永远在数据库
     command: ["redis-server", "--save", "", "--appendonly", "no"]
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 10
+    # 不映射到宿主机端口
 
   web:
-    build:
-      context: .
-      dockerfile: deploy/backend.Dockerfile
-    restart: unless-stopped
-    command: ["gunicorn", "config.wsgi:application", "--bind", "0.0.0.0:8000", "--workers", "2", "--timeout", "120"]
-    environment:
-      <<: *backend-env
-      APP_ENV: production
-    volumes: *backend-volumes
-    depends_on:
-      db:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+    <<: *backend-base
+    command:
+      - gunicorn
+      - config.wsgi:application
+      - --bind
+      - 0.0.0.0:8000
+      - --workers
+      - "2"
+      - --timeout
+      - "120"
+      - --access-logfile
+      - "-"
+    environment: *backend-environment
+    # 前端与 nginx 尚未创建，先只绑定回环地址，不暴露到局域网
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on: *backend-depends
 
   worker:
-    build:
-      context: .
-      dockerfile: deploy/backend.Dockerfile
-    restart: unless-stopped
+    <<: *backend-base
     # 并发与预取保持保守：正文逐节生成时不得出现未计入限制的并发调用
-    command: ["celery", "-A", "config", "worker", "--loglevel=INFO", "--concurrency=2", "--prefetch-multiplier=1"]
-    environment: *backend-env
-    volumes: *backend-volumes
-    depends_on:
-      web:
-        condition: service_started
+    command:
+      - celery
+      - -A
+      - config
+      - worker
+      - --loglevel=INFO
+      - --concurrency=2
+      - --prefetch-multiplier=1
+    environment: *backend-environment
+    depends_on: *backend-depends
 
   beat:
-    build:
-      context: .
-      dockerfile: deploy/backend.Dockerfile
-    restart: unless-stopped
+    <<: *backend-base
     # reconcile_jobs / cleanup_expired_artifacts 的定时入口
     command: ["celery", "-A", "config", "beat", "--loglevel=INFO"]
-    environment: *backend-env
-    volumes: *backend-volumes
-    depends_on:
-      web:
-        condition: service_started
+    environment: *backend-environment
+    depends_on: *backend-depends
 
   # 前端服务尚未创建：本次骨架只交付 Django 后端。
-  # frontend/ 与 deploy/frontend.Dockerfile、deploy/nginx.conf 落地后，
-  # 在此增加一个同域反向代理服务（静态资源 + /api 转发），
-  # 不要把 PRIVATE_STORAGE_ROOT 映射成公开静态目录。
+  # frontend/ 与 deploy/frontend.Dockerfile、deploy/nginx.conf 落地后：
+  #   1. 在此增加一个同域反向代理服务（静态资源 + /api 转发）；
+  #   2. 把 web 的 ports 改为仅容器内可达，不要继续直接暴露；
+  #   3. 把 DJANGO_SECURE_COOKIES 改为 true（或删掉让 settings 自动取 true）。
 
 volumes:
   pgdata:
