@@ -14,6 +14,7 @@ from typing import Any
 
 from django.apps import apps
 from django.db import transaction
+from django.utils import timezone
 
 from apps.common.http import api_error
 
@@ -80,3 +81,5 @@ def check_execution_lease(job: Any, lease_token: int, *, allow_cancelling: bool 
         raise api_error("INVALID_JOB_STATE", "任务已被请求取消")
     if int(job.lease_token) != int(lease_token):
         raise api_error("INVALID_JOB_STATE", "执行租约已被新的尝试取代")
+    if job.lease_expires_at is None or job.lease_expires_at <= timezone.now():
+        raise api_error("INVALID_JOB_STATE", "执行租约已过期")

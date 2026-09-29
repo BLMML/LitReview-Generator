@@ -91,7 +91,10 @@ def env_decimal(name: str, default: Decimal) -> Decimal:
     if raw is None or raw == "":
         return default
     try:
-        return Decimal(raw)
+        result = Decimal(raw)
+        if not result.is_finite() or result < 0:
+            raise InvalidOperation
+        return result
     except InvalidOperation as exc:
         raise ConfigurationError(f"环境变量 {name} 必须是十进制数字；金额统一用十进制定点。") from exc
 
@@ -194,22 +197,19 @@ TEMPLATES = [
     },
 ]
 
+
 # ── 数据库 ────────────────────────────────────────────────────
 def _postgres_from_url(url: str) -> dict[str, object]:
     parsed = urlparse(url)
     if parsed.scheme not in {"postgres", "postgresql"}:
         raise ConfigurationError("DATABASE_URL 目前只支持 postgresql:// 连接串。")
     options: dict[str, object] = {}
-    query = dict(
-        pair.split("=", 1) for pair in parsed.query.split("&") if "=" in pair
-    )
+    query = dict(pair.split("=", 1) for pair in parsed.query.split("&") if "=" in pair)
     if query.get("sslmode"):
         options["sslmode"] = query["sslmode"]
     # 连接超时：数据库没起来时快速失败并给出明确错误，
     # 而不是让每个请求挂到操作系统的 TCP 超时（实测能到几分钟）。
-    options.setdefault(
-        "connect_timeout", env_int("DJANGO_DB_CONNECT_TIMEOUT", 5, minimum=1)
-    )
+    options.setdefault("connect_timeout", env_int("DJANGO_DB_CONNECT_TIMEOUT", 5, minimum=1))
     return {
         "ENGINE": "django.db.backends.postgresql",
         "NAME": unquote(parsed.path.lstrip("/")),
@@ -395,30 +395,47 @@ LLM_MAX_INPUT_TOKENS = env_int("LLM_MAX_INPUT_TOKENS", 24000, minimum=1)
 LLM_MAX_OUTPUT_TOKENS = env_int("LLM_MAX_OUTPUT_TOKENS", 4096, minimum=1)
 LLM_MAX_CONCURRENCY = env_int("LLM_MAX_CONCURRENCY", 2, minimum=1)
 
-if LLM_MODE == "real":
-    # 真实调用必须同时具备密钥与已核验价目；缺一不可，避免给出无法解释的账。
-    _missing = [
-        name
-        for name in ("DEEPSEEK_API_KEY",)
-        if not os.environ.get(name)
-    ]
-    if _missing:
-        raise ConfigurationError(
-            "LLM_MODE=real 需要先配置：" + "、".join(_missing) + "（值不出现在本消息中）。"
-        )
-
 LLM_PRICING = {
-    "input_cache_hit_per_million_usd": env_decimal(
-        "LLM_PRICE_INPUT_CACHE_HIT_PER_MILLION_USD", Decimal("0")
-    ),
-    "input_cache_miss_per_million_usd": env_decimal(
-        "LLM_PRICE_INPUT_CACHE_MISS_PER_MILLION_USD", Decimal("0")
-    ),
-    "output_per_million_usd": env_decimal("LLM_PRICE_OUTPUT_PER_MILLION_USD", Decimal("0")),
+    band: {
+        f"{component}_per_million_usd": env_decimal(
+            f"LLM_PRICE_{component.upper()}_{band.upper()}_PER_MILLION_USD",
+            Decimal("0"),
+        )
+        for component in ("input_cache_hit", "input_cache_miss", "output")
+    }
+    for band in ("peak", "off_peak")
 }
+LLM_PRICING_VERSION = env_str("LLM_PRICING_VERSION")
+LLM_PRICING_CALENDAR_YEAR = env_int("LLM_PRICING_CALENDAR_YEAR", 0, minimum=0)
+# 运维核验的 UTC 日期（YYYY-MM-DD），这些日期全天为谷时；不在线猜测节假日。
+LLM_PRICING_OFF_PEAK_DATES_UTC = env_list("LLM_PRICING_OFF_PEAK_DATES_UTC")
+from datetime import date  # noqa: E402
+
+try:
+    for _holiday in LLM_PRICING_OFF_PEAK_DATES_UTC:
+        if date.fromisoformat(_holiday).year != LLM_PRICING_CALENDAR_YEAR:
+            raise ValueError
+except ValueError as exc:
+    raise ConfigurationError("LLM_PRICING_OFF_PEAK_DATES_UTC 必须是日历年份内的 ISO 日期") from exc
 
 # 项目默认预算。零或未配置不得被解释为无限预算。
 PROJECT_DEFAULT_BUDGET_USD = env_decimal("PROJECT_DEFAULT_BUDGET_USD", Decimal("0"))
+
+if LLM_MODE == "real":
+    _missing = []
+    if not DEEPSEEK_API_KEY:
+        _missing.append("DEEPSEEK_API_KEY")
+    if not LLM_PRICING_VERSION:
+        _missing.append("LLM_PRICING_VERSION")
+    if not LLM_PRICING_CALENDAR_YEAR or not LLM_PRICING_OFF_PEAK_DATES_UTC:
+        _missing.append("LLM_PRICING_CALENDAR_YEAR / LLM_PRICING_OFF_PEAK_DATES_UTC")
+    if PROJECT_DEFAULT_BUDGET_USD <= 0:
+        _missing.append("PROJECT_DEFAULT_BUDGET_USD")
+    for _component in LLM_PRICING["peak"]:
+        if not 0 < LLM_PRICING["off_peak"][_component] <= LLM_PRICING["peak"][_component]:
+            _missing.append(f"LLM_PRICE_{_component.upper()} 的峰谷价")
+    if _missing:
+        raise ConfigurationError("真实调用配置不完整：" + "、".join(_missing))
 
 ARXIV_CONTACT = env_str("ARXIV_CONTACT")
 

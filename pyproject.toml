@@ -19,6 +19,7 @@ dependencies = [
     "scikit-learn~=1.7",
     # arXiv 元数据与 PDF 下载
     "httpx~=0.28",
+    "jsonschema>=4.23,<5",
     # Word 导出
     "python-docx~=1.2",
 ]
@@ -73,3 +74,6 @@ ignore = [
 # docs/mvp/02 明确规定 source_id / provider_request_id / result 等字段可空，
 # 且空值语义与空字符串不同（部分唯一约束依赖 NULL）。此处按契约保留 null=True。
 "backend/apps/**/models.py" = ["DJ001"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["apps", "config"]

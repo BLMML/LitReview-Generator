@@ -12,11 +12,16 @@
 
 from __future__ import annotations
 
+import json
+import math
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
+
+from django.conf import settings
+from jsonschema import Draft202012Validator, FormatChecker
 
 from apps.common.http import api_error
 
@@ -66,8 +71,6 @@ PROVIDER_ERROR_CODES = {
     "output_invalid": "MODEL_OUTPUT_INVALID",
 }
 
-NOT_IMPLEMENTED_MESSAGE = "llm.schemas.normalize_response 尚未实现（MVP 骨架阶段，见 docs/mvp/05 阶段 B）"
-
 
 @dataclass(frozen=True)
 class ModelUsage:
@@ -112,7 +115,143 @@ def normalize_response(raw: Mapping[str, Any]) -> ModelTaskResult:
 
     结构正确只表示格式符合要求；事实支持仍需证据核验和人工评审。
     """
-    raise api_error("SERVICE_UNAVAILABLE", NOT_IMPLEMENTED_MESSAGE, retryable=False)
+    try:
+        choices = raw["choices"]
+        if not isinstance(choices, list) or len(choices) != 1:
+            raise ValueError
+        choice = choices[0]
+        if choice["finish_reason"] != "stop":
+            raise ValueError
+        content = choice["message"]["content"]
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError
+        payload = json.loads(content, parse_constant=_reject_constant, object_pairs_hook=_unique_keys)
+        if not isinstance(payload, dict):
+            raise ValueError
+        provider_id = raw.get("id")
+        if provider_id is not None and (not isinstance(provider_id, str) or len(provider_id) > 191):
+            raise ValueError
+    except (KeyError, TypeError, ValueError, RecursionError) as exc:
+        raise api_error("MODEL_OUTPUT_INVALID", "模型响应为空、截断或格式不合法") from exc
+    return ModelTaskResult(payload, provider_id, normalize_usage(raw.get("usage")), "stop", "")
+
+
+def _reject_constant(value: str) -> None:
+    raise ValueError("Non-finite JSON number")
+
+
+def _unique_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("Duplicate JSON key")
+        result[key] = value
+    return result
+
+
+def normalize_usage(raw: Any) -> ModelUsage:
+    """只保留已知计数字段，不把供应商任意文本写入账本。"""
+    if not isinstance(raw, Mapping):
+        return ModelUsage()
+
+    def count(value: Any) -> int | None:
+        return value if type(value) is int and 0 <= value <= 10**12 else None
+
+    incoming = count(raw.get("prompt_tokens"))
+    outgoing = count(raw.get("completion_tokens"))
+    hit = count(raw.get("prompt_cache_hit_tokens"))
+    details = raw.get("prompt_tokens_details")
+    if hit is None and isinstance(details, Mapping):
+        hit = count(details.get("cached_tokens"))
+    miss = count(raw.get("prompt_cache_miss_tokens"))
+    if incoming is not None:
+        if hit is not None and miss is None and hit <= incoming:
+            miss = incoming - hit
+        elif miss is not None and hit is None and miss <= incoming:
+            hit = incoming - miss
+        if hit is not None and miss is not None and hit + miss != incoming:
+            hit = miss = None
+    elif hit is not None and miss is not None:
+        incoming = hit + miss
+    safe = {
+        "prompt_tokens": incoming,
+        "completion_tokens": outgoing,
+        "prompt_cache_hit_tokens": hit,
+        "prompt_cache_miss_tokens": miss,
+    }
+    return ModelUsage(incoming, outgoing, hit, miss, safe)
+
+
+TASK_DEFINITIONS = dict(
+    zip(
+        TASK_TYPES,
+        (
+            "PageExtract",
+            "PaperExtract",
+            "Topics",
+            "Disputes",
+            "QueryExpand",
+            "Rerank",
+            "ReviewSection",
+            "VerifyBlocks",
+        ),
+        strict=True,
+    )
+)
+
+
+def output_schema(task_type: str) -> dict[str, Any]:
+    if task_type not in TASK_DEFINITIONS:
+        raise api_error("VALIDATION_ERROR", "未知模型任务类型")
+    path = settings.REPO_ROOT / "docs/mvp/contracts/model_outputs.schema.json"
+    if not path.is_file():
+        path = settings.BASE_DIR / "contracts/model_outputs.schema.json"
+    root = json.loads(path.read_text(encoding="utf-8"))
+    return {"$defs": root["$defs"], "$ref": f"#/$defs/{TASK_DEFINITIONS[task_type]}"}
+
+
+def validate_payload(request: ModelTaskRequest, payload: Mapping[str, Any]) -> None:
+    """任务专属 Schema 与请求白名单；事实支持仍由领域模块核验。"""
+    validator = Draft202012Validator(output_schema(request.task_type), format_checker=FormatChecker())
+    if not validator.is_valid(payload):
+        raise api_error("MODEL_OUTPUT_INVALID", "模型输出不符合任务 Schema")
+    evidence = {str(i) for i in request.allowed_evidence_ids}
+    papers = {str(i) for i in request.allowed_paper_ids}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, float) and not math.isfinite(node):
+            raise api_error("MODEL_OUTPUT_INVALID")
+        if isinstance(node, list):
+            for item in node:
+                visit(item)
+        if not isinstance(node, Mapping):
+            return
+        for key, value in node.items():
+            allowed = None
+            if key in {"evidence_id", "evidence_ids"}:
+                allowed = evidence
+            elif key in {"paper_ids", "unassigned_paper_ids", "left_paper_id", "right_paper_id"}:
+                allowed = papers
+            if allowed is not None:
+                ids = value if isinstance(value, list) else [value]
+                if any(str(i) not in allowed for i in ids) or len(set(ids)) != len(ids):
+                    raise api_error("MODEL_OUTPUT_INVALID", "引用不在请求白名单内或存在重复引用")
+            visit(value)
+        if "value" in node and node["value"] is not None and not node.get("evidence_ids"):
+            raise api_error("MODEL_OUTPUT_INVALID", "事实要素缺少证据")
+        if "left_paper_id" in node and node["left_paper_id"] == node["right_paper_id"]:
+            raise api_error("MODEL_OUTPUT_INVALID", "争议两侧必须是不同论文")
+
+    visit(payload)
+    if request.task_type == TASK_RERANK:
+        ids = [r["evidence_id"] for r in payload["results"]]
+        if len(ids) != len(set(ids)):
+            raise api_error("MODEL_OUTPUT_INVALID", "重排结果重复")
+    if request.task_type == TASK_VERIFY_BLOCKS:
+        expected = {str(b["block_id"]) for b in request.payload.get("blocks_with_evidence", [])}
+        actual = [b["block_id"] for b in payload["blocks"]]
+        if set(actual) != expected or len(actual) != len(set(actual)):
+            raise api_error("MODEL_OUTPUT_INVALID", "核验结果未完整覆盖输入块")
 
 
 def provider_error_code(reason: str) -> str:

@@ -19,6 +19,7 @@ from typing import Any
 
 from celery import shared_task
 from django.conf import settings
+from django.db import transaction
 from django.utils import timezone
 
 from apps.common.http import set_log_context
@@ -36,6 +37,7 @@ from apps.jobs.services import (
     active_jobs_for_reconcile,
     claim_execution,
     dispatch,
+    execution_heartbeat,
     fail_job,
     mark_cancelled,
 )
@@ -98,9 +100,10 @@ def execute_job(self: Any, job_id: str) -> str:
         return "unimplemented"
 
     try:
-        handler(context, job.resource_id)
+        with execution_heartbeat(context):
+            handler(context, job.resource_id)
     except Exception as exc:  # noqa: BLE001 - 统一收敛为 Job.error
-        logger.exception("任务执行失败 %s", job_id)
+        logger.warning("任务执行失败 %s (%s)", job_id, type(exc).__name__)
         _record_failure(context, exc)
         return "failed"
 
@@ -108,6 +111,12 @@ def execute_job(self: Any, job_id: str) -> str:
     current = Job.objects.filter(pk=job_uuid).first()
     if current is not None and current.status == JOB_STATUS_CANCELLING:
         mark_cancelled(context, current)
+    elif current is not None and current.status == "running":
+        fail_job(
+            context,
+            {"code": "INTERNAL_ERROR", "message": "执行函数未提交终态", "details": {}, "retryable": True},
+        )
+        return "failed"
     return "done"
 
 
@@ -142,14 +151,39 @@ def reconcile_jobs() -> dict[str, int]:
             dispatch(job)
             redispatched += 1
         else:
-            # 租约过期：把状态交回 queued，由下一次扫描重新投递；
-            # 旧 worker 持有的 token 已失效，无法再提交结果。
-            Job.objects.filter(pk=job.pk, lease_token=job.lease_token).update(
-                status="queued",
-                lease_expires_at=None,
-                dispatch_attempts=job.dispatch_attempts + 1,
-            )
-            expired += 1
+            # 先撤销旧执行资格，再终止本次尝试；不自动重做可能已付费的请求。
+            from apps.llm.budget import abandon_calls
+
+            with transaction.atomic():
+                locked = Job.objects.select_for_update().get(pk=job.pk)
+                if (
+                    locked.status not in ("running", "cancelling")
+                    or locked.lease_expires_at is None
+                    or locked.lease_expires_at >= timezone.now()
+                ):
+                    continue
+                abandon_calls(locked)
+                locked.lease_token += 1
+                locked.status = "cancelled" if locked.cancel_requested_at else "failed"
+                locked.error = {
+                    "code": "WORKER_LOST",
+                    "message": "执行租约过期",
+                    "details": {},
+                    "retryable": True,
+                }
+                locked.finished_at = timezone.now()
+                locked.lease_expires_at = None
+                locked.save(
+                    update_fields=[
+                        "lease_token",
+                        "status",
+                        "error",
+                        "finished_at",
+                        "lease_expires_at",
+                        "updated_at",
+                    ]
+                )
+                expired += 1
     if redispatched or expired:
         logger.info("reconcile_jobs：补投 %s，回收过期租约 %s", redispatched, expired)
     return {"redispatched": redispatched, "expired": expired}

@@ -60,12 +60,8 @@ class UsageBudget(TimeStampedModel):
         db_table = "llm_usage_budget"
         constraints = [
             models.CheckConstraint(condition=Q(limit_usd__gte=0), name="budget_limit_non_negative"),
-            models.CheckConstraint(
-                condition=Q(settled_usd__gte=0), name="budget_settled_non_negative"
-            ),
-            models.CheckConstraint(
-                condition=Q(reserved_usd__gte=0), name="budget_reserved_non_negative"
-            ),
+            models.CheckConstraint(condition=Q(settled_usd__gte=0), name="budget_settled_non_negative"),
+            models.CheckConstraint(condition=Q(reserved_usd__gte=0), name="budget_reserved_non_negative"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用
@@ -125,6 +121,7 @@ class ModelCall(TimeStampedModel):
     started_at = models.DateTimeField(null=True, blank=True)
     finished_at = models.DateTimeField(null=True, blank=True)
     settled_at = models.DateTimeField(null=True, blank=True)
+    slot_expires_at = models.DateTimeField(null=True, blank=True, db_index=True)
 
     # 脱敏失败摘要与供应商 usage 原始计数
     error = models.JSONField(null=True, blank=True)
@@ -144,9 +141,7 @@ class ModelCall(TimeStampedModel):
                 condition=Q(network_attempt__gte=1, network_attempt__lte=3),
                 name="model_call_network_attempt_range",
             ),
-            models.CheckConstraint(
-                condition=Q(reserved_usd__gte=0), name="model_call_reserved_non_negative"
-            ),
+            models.CheckConstraint(condition=Q(reserved_usd__gte=0), name="model_call_reserved_non_negative"),
         ]
         indexes = [
             models.Index(fields=["job", "created_at"], name="model_call_job_created_idx"),
@@ -157,3 +152,16 @@ class ModelCall(TimeStampedModel):
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用
         return f"ModelCall({self.task_type}, {self.outcome})"
+
+
+class ModelCallGate(models.Model):
+    """部署共享的单行互斥器；短事务串行认领名额，不持锁等待网络。"""
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+
+    class Meta:
+        db_table = "llm_model_call_gate"
+        constraints = [models.CheckConstraint(condition=Q(id=1), name="model_call_gate_singleton")]
+
+    def __str__(self) -> str:
+        return "ModelCallGate(global)"

@@ -244,8 +244,9 @@ def test_concurrent_accept_only_one_wins(project_a, user_a):
 
 def test_row_lock_serializes_project_writes(project_a, user_a):
     """select_for_update 在 PostgreSQL 上真的会阻塞第二个事务。"""
-    from apps.common.locking import lock_project
     from django.db import transaction
+
+    from apps.common.locking import lock_project
 
     observed: list[str] = []
 

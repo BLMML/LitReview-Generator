@@ -15,20 +15,24 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
+import threading
 import uuid
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
 from django.conf import settings
-from django.db import transaction
+from django.db import close_old_connections, transaction
 from django.db.models import Max, Q
 from django.utils import timezone
 
 from apps.common.auth import ActorContext
 from apps.common.http import api_error
-from apps.common.locking import lock_project, require_project_idle
+from apps.common.idempotency import Claim, claim_or_replay, record_claim, request_fingerprint
+from apps.common.locking import check_execution_lease, lock_project, require_project_idle
 from apps.jobs.models import (
     ACTIVE_JOB_STATUSES,
     JOB_KIND_IMPORT_ARXIV,
@@ -51,6 +55,7 @@ class AcceptedJob:
     job_id: uuid.UUID
     resource_type: str
     resource_id: uuid.UUID
+    replayed: bool = False
 
     def as_dto(self) -> dict[str, str]:
         return {
@@ -79,6 +84,10 @@ class ExecutionContext:
     def ensure_not_cancelled(self) -> None:
         if self.cancel_checker():
             raise api_error("INVALID_JOB_STATE", "任务已被请求取消")
+        job = Job.objects.filter(pk=self.job_id, project_id=self.project_id).first()
+        if job is None:
+            raise api_error("INVALID_JOB_STATE")
+        check_execution_lease(job, self.lease_token)
 
 
 def payload_fingerprint(frozen_input: Mapping[str, Any]) -> str:
@@ -102,7 +111,8 @@ def accept_job(
     因此该 kind 传 `resource_id=None`，由本函数生成。
 
     必须在 Project 行锁内完成：幂等查找 → 空闲校验 → 冻结输入 → 创建 Job。
-    调用方负责在同一事务内写入幂等记录；提交后再投递队列。
+    传入 key 或 Claim 时由本服务在同一事务写幂等记录；提交后自动投递队列。
+    领域调用方应在外层同一事务内预建资源，不得重复记录幂等响应或重复 dispatch。
     """
     if kind not in JOB_KIND_RESOURCE_TYPE:
         raise api_error("VALIDATION_ERROR", "不支持的任务类型")
@@ -115,6 +125,14 @@ def accept_job(
 
     with transaction.atomic():
         locked = lock_project(project.pk, owner=actor.user)
+        claim = _claim(
+            actor,
+            f"/api/v1/projects/{project.pk}/jobs/{kind}",
+            idempotency,
+            {"kind": kind, "frozen_input": frozen_input},
+        )
+        if claim is not None and claim.is_replay:
+            return _replayed(claim)
         require_project_idle(locked)
 
         job_id = uuid.uuid4()
@@ -136,7 +154,26 @@ def accept_job(
             progress=default_progress(),
         )
 
-    return AcceptedJob(job_id=job.id, resource_type=resource_type, resource_id=resource_id)
+        result = AcceptedJob(job_id=job.id, resource_type=resource_type, resource_id=resource_id)
+        if claim is not None:
+            record_claim(claim, status_code=202, body=result.as_dto(), project=locked, job=job)
+        transaction.on_commit(lambda: dispatch(job))
+    return result
+
+
+def _claim(actor: ActorContext, path: str, key: Any, payload: dict) -> Any:
+    if key is None:
+        return None
+    if isinstance(key, Claim):
+        return claim_or_replay(actor, key.method, key.canonical_path, key.key, key.request_hash)
+    return claim_or_replay(actor, "POST", path, uuid.UUID(str(key)), request_fingerprint(payload))
+
+
+def _replayed(claim: Any) -> AcceptedJob:
+    data = claim.body
+    return AcceptedJob(
+        uuid.UUID(data["job_id"]), data["resource_type"], uuid.UUID(data["resource_id"]), replayed=True
+    )
 
 
 def dispatch(job: Job) -> None:
@@ -146,13 +183,18 @@ def dispatch(job: Job) -> None:
     """
     from apps.jobs.tasks import execute_job
 
+    if not Job.objects.filter(pk=job.pk, status=JOB_STATUS_QUEUED).exists():
+        return
+    from django.db.models import F
+
     try:
         execute_job.delay(str(job.id))
     except Exception:  # pragma: no cover - broker 不可用时走补投路径
-        Job.objects.filter(pk=job.pk).update(
-            dispatch_attempts=job.dispatch_attempts + 1,
-            last_dispatched_at=timezone.now(),
-        )
+        logging.getLogger(__name__).warning("任务队列投递失败，将由恢复扫描补投：%s", job.pk)
+    Job.objects.filter(pk=job.pk).update(
+        dispatch_attempts=F("dispatch_attempts") + 1,
+        last_dispatched_at=timezone.now(),
+    )
 
 
 # ── 领取与续租 ────────────────────────────────────────────────
@@ -172,12 +214,7 @@ def claim_execution(job_id: uuid.UUID) -> ExecutionContext:
         if job.cancel_requested_at is not None:
             raise api_error("INVALID_JOB_STATE", "任务已被请求取消")
 
-        if job.status == JOB_STATUS_RUNNING:
-            expires = job.lease_expires_at
-            if expires is None or expires > now:
-                # 已有有效执行者持有租约：重复队列消息直接丢弃
-                raise api_error("INVALID_JOB_STATE", "任务已被其他 worker 领取")
-        elif job.status != JOB_STATUS_QUEUED:
+        if job.status != JOB_STATUS_QUEUED:
             raise api_error("INVALID_JOB_STATE", "任务不在可领取状态")
 
         job.lease_token += 1
@@ -209,9 +246,7 @@ def claim_execution(job_id: uuid.UUID) -> ExecutionContext:
 
 def _cancel_requested(job_id: uuid.UUID) -> bool:
     """从数据库重新读取取消意图：内存标记不能作为唯一依据。"""
-    return (
-        Job.objects.filter(pk=job_id, cancel_requested_at__isnull=False).exists()
-    )
+    return Job.objects.filter(pk=job_id, cancel_requested_at__isnull=False).exists()
 
 
 def heartbeat(context: ExecutionContext) -> None:
@@ -221,12 +256,55 @@ def heartbeat(context: ExecutionContext) -> None:
         pk=context.job_id,
         status__in=(JOB_STATUS_RUNNING, JOB_STATUS_CANCELLING),
         lease_token=context.lease_token,
+        lease_expires_at__gt=now,
     ).update(
         heartbeat_at=now,
         lease_expires_at=now + timedelta(seconds=int(settings.JOB_LEASE_SECONDS)),
     )
     if not updated:
         raise api_error("INVALID_JOB_STATE", "执行租约已失效")
+    from apps.llm.models import ModelCall
+
+    ModelCall.objects.filter(
+        job_id=context.job_id, lease_token=context.lease_token, outcome__in=("reserved", "in_flight")
+    ).update(
+        slot_expires_at=now
+        + timedelta(
+            seconds=settings.LLM_REQUEST_TIMEOUT_SECONDS + settings.JOB_LEASE_SECONDS,
+        ),
+    )
+
+
+@contextmanager
+def execution_heartbeat(context: ExecutionContext):
+    """用独立数据库连接续租，网络等待不占事务；退出时关闭线程连接。"""
+    heartbeat(context)
+    stopped = threading.Event()
+    errors = []
+
+    def renew():
+        close_old_connections()
+        try:
+            while not stopped.wait(settings.JOB_HEARTBEAT_SECONDS):
+                try:
+                    heartbeat(context)
+                except Exception as exc:
+                    errors.append(exc)
+                    return
+        finally:
+            from django.db import connections
+
+            connections.close_all()
+
+    thread = threading.Thread(target=renew, name="job-heartbeat", daemon=True)
+    thread.start()
+    try:
+        yield
+        if errors:
+            raise api_error("INVALID_JOB_STATE", "续租失败，禁止提交本次结果")
+    finally:
+        stopped.set()
+        thread.join(timeout=settings.DATABASES["default"].get("OPTIONS", {}).get("connect_timeout", 5) + 1)
 
 
 def record_progress(
@@ -244,6 +322,7 @@ def record_progress(
         job = Job.objects.select_for_update().filter(pk=context.job_id).first()
         if job is None or int(job.lease_token) != int(token):
             raise api_error("INVALID_JOB_STATE", "执行租约已被新的尝试取代")
+        check_execution_lease(job, token)
         if job.cancel_requested_at is not None:
             raise api_error("INVALID_JOB_STATE", "任务已被请求取消")
 
@@ -268,11 +347,7 @@ def cancel_job(actor: ActorContext, job_id: uuid.UUID) -> Job:
     """
     now = timezone.now()
     with transaction.atomic():
-        job = (
-            Job.objects.select_for_update()
-            .filter(pk=job_id, project__owner=actor.user)
-            .first()
-        )
+        job = Job.objects.select_for_update().filter(pk=job_id, project__owner=actor.user).first()
         if job is None:
             raise api_error("NOT_FOUND")
 
@@ -286,9 +361,7 @@ def cancel_job(actor: ActorContext, job_id: uuid.UUID) -> Job:
         else:
             job.status = JOB_STATUS_CANCELLING
             job.cancel_requested_at = job.cancel_requested_at or now
-        job.save(
-            update_fields=["status", "cancel_requested_at", "finished_at", "updated_at"]
-        )
+        job.save(update_fields=["status", "cancel_requested_at", "finished_at", "updated_at"])
         return job
 
 
@@ -309,9 +382,12 @@ def _finish(
             raise api_error("NOT_FOUND")
         if int(job.lease_token) != int(context.lease_token):
             raise api_error("INVALID_JOB_STATE", "执行租约已被新的尝试取代")
+        check_execution_lease(job, context.lease_token, allow_cancelling=True)
         if job.cancel_requested_at is not None and status == JOB_STATUS_SUCCEEDED:
             # 取消先提交则不能发布成功结果
             raise api_error("INVALID_JOB_STATE", "任务已被请求取消，不能发布成功结果")
+        if job.cancel_requested_at is not None and status == JOB_STATUS_FAILED:
+            status = JOB_STATUS_CANCELLED
 
         if finalize_resource is not None:
             finalize_resource(job)
@@ -360,8 +436,15 @@ def mark_cancelled(context: ExecutionContext, job: Job) -> Job:
     now = timezone.now()
     with transaction.atomic():
         locked = Job.objects.select_for_update().filter(pk=job.pk).first()
-        if locked is None or locked.status in (JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED):
+        if locked is None:
+            raise api_error("NOT_FOUND")
+        if locked.lease_token != context.lease_token:
+            raise api_error("INVALID_JOB_STATE", "取消收尾租约已失效")
+        if locked.status in (JOB_STATUS_SUCCEEDED, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
             return locked or job
+        check_execution_lease(locked, context.lease_token, allow_cancelling=True)
+        if locked.cancel_requested_at is None:
+            raise api_error("INVALID_JOB_STATE", "没有取消请求")
         locked.status = JOB_STATUS_CANCELLED
         locked.finished_at = now
         locked.save(update_fields=["status", "finished_at", "updated_at"])
@@ -375,16 +458,15 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
     resource_id 与 frozen_input 沿用；attempt 在 Project 锁内递增，旧 Job 历史不改写。
     """
     with transaction.atomic():
-        previous = (
-            Job.objects.select_for_update()
-            .filter(pk=job_id, project__owner=actor.user)
-            .first()
-        )
+        previous = Job.objects.filter(pk=job_id, project__owner=actor.user).first()
         if previous is None:
             raise api_error("NOT_FOUND")
 
         locked = lock_project(previous.project_id, owner=actor.user)
-        require_project_idle(locked)
+        previous = Job.objects.select_for_update().get(pk=previous.pk)
+        claim = _claim(actor, f"/api/v1/jobs/{job_id}/retry", idempotency, {})
+        if claim is not None and claim.is_replay:
+            return _replayed(claim)
 
         if previous.status not in (JOB_STATUS_FAILED, JOB_STATUS_CANCELLED):
             raise api_error("INVALID_JOB_STATE", "只有失败或已取消的任务可以重试")
@@ -401,6 +483,8 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
         if newer is not None:
             # 不能在 J1 失败、J2 成功后重新执行 J1
             raise api_error("INVALID_JOB_STATE", "该资源已有更新的尝试")
+        require_project_idle(locked)
+        _check_retry_resource(previous)
 
         latest_attempt = (
             Job.objects.filter(
@@ -423,11 +507,35 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
             attempt=latest_attempt + 1,
             progress=default_progress(),
         )
-        return AcceptedJob(
+        result = AcceptedJob(
             job_id=new_job.id,
             resource_type=new_job.resource_type,
             resource_id=new_job.resource_id,
         )
+        if claim is not None:
+            record_claim(claim, status_code=202, body=result.as_dto(), project=locked, job=new_job)
+        transaction.on_commit(lambda: dispatch(new_job))
+        return result
+
+
+def _check_retry_resource(job: Job) -> None:
+    from django.apps import apps
+
+    run_id = job.resource_id if job.kind == "analyze" else job.frozen_input.get("run_id")
+    if run_id and job.kind in ("analyze", "retrieve", "generate_review"):
+        run = (
+            apps.get_model("analysis", "AnalysisRun")
+            .objects.filter(
+                pk=run_id,
+                project_id=job.project_id,
+            )
+            .first()
+        )
+        if run is None:
+            raise api_error("NOT_FOUND")
+        project = apps.get_model("projects", "Project").objects.get(pk=job.project_id)
+        if run.corpus_revision != project.corpus_revision:
+            raise api_error("STALE_RUN")
 
 
 def active_jobs_for_reconcile(*, stale_before: datetime, limit: int = 100) -> list[Job]:
@@ -436,7 +544,9 @@ def active_jobs_for_reconcile(*, stale_before: datetime, limit: int = 100) -> li
     Redis 锁不能替代持久唯一约束，因此这里以数据库条件查询为准。
     """
     now = timezone.now()
-    stale_queued = Q(status=JOB_STATUS_QUEUED, created_at__lt=stale_before)
+    stale_queued = Q(status=JOB_STATUS_QUEUED, created_at__lt=stale_before) & (
+        Q(last_dispatched_at__isnull=True) | Q(last_dispatched_at__lt=stale_before)
+    )
     expired_lease = Q(
         status__in=(JOB_STATUS_RUNNING, JOB_STATUS_CANCELLING),
         lease_expires_at__lt=now,

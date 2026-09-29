@@ -30,7 +30,7 @@ from apps.common.http import (
 )
 from apps.common.idempotency import parse_idempotency_key
 from apps.jobs.models import JOB_KIND_RESOURCE_TYPE, Job
-from apps.jobs.services import cancel_job, dispatch, retry_job
+from apps.jobs.services import cancel_job, retry_job
 
 ZERO = Decimal("0")
 
@@ -88,11 +88,7 @@ class JobSerializer(serializers.Serializer):
 def get_job(request: Any, job_id: Any) -> Response:
     """GET /jobs/{job_id}。"""
     actor = require_actor(request)
-    job = (
-        Job.objects.select_related("project")
-        .filter(pk=job_id, project__owner=actor.user)
-        .first()
-    )
+    job = Job.objects.select_related("project").filter(pk=job_id, project__owner=actor.user).first()
     if job is None:
         from apps.common.http import api_error
 
@@ -114,9 +110,6 @@ def job_retry(request: Any, job_id: Any) -> Response:
     actor = require_actor(request)
     key = parse_idempotency_key(idempotency_header_key(request))
     accepted_job = retry_job(actor, job_id, idempotency=key)
-    new_job = Job.objects.filter(pk=accepted_job.job_id).first()
-    if new_job is not None:
-        dispatch(new_job)
     return accepted(accepted_job.as_dto(), request=request)
 
 

@@ -10,27 +10,37 @@
       "payload": {
         "research_question": {
           "value": "小样本条件下注意力机制是否仍然有效",
-          "evidence_ids": ["11111111-1111-4111-8111-111111111111"]
+          "evidence_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ]
         },
         "research_object": {
           "value": "图像分类基准数据集",
-          "evidence_ids": ["11111111-1111-4111-8111-111111111111"]
+          "evidence_ids": [
+            "11111111-1111-4111-8111-111111111111"
+          ]
         },
         "summary": {
           "value": "论文比较了注意力模块与卷积基线在小样本设置下的表现。",
-          "evidence_ids": ["22222222-2222-4222-8222-222222222222"]
+          "evidence_ids": [
+            "22222222-2222-4222-8222-222222222222"
+          ]
         },
         "methods": [
           {
             "value": "在冻结主干网络的条件下替换注意力模块",
-            "evidence_ids": ["22222222-2222-4222-8222-222222222222"]
+            "evidence_ids": [
+              "22222222-2222-4222-8222-222222222222"
+            ]
           }
         ],
         "datasets": [],
         "metrics": [
           {
             "value": "top-1 准确率",
-            "evidence_ids": ["33333333-3333-4333-8333-333333333333"]
+            "evidence_ids": [
+              "33333333-3333-4333-8333-333333333333"
+            ]
           }
         ],
         "conclusions": [],
@@ -49,9 +59,18 @@
       "expected": "rejected",
       "reject_reason": "有事实 value 但 evidence_ids 为空",
       "payload": {
-        "research_question": { "value": "有结论但没给证据", "evidence_ids": [] },
-        "research_object": { "value": null, "evidence_ids": [] },
-        "summary": { "value": null, "evidence_ids": [] },
+        "research_question": {
+          "value": "有结论但没给证据",
+          "evidence_ids": []
+        },
+        "research_object": {
+          "value": null,
+          "evidence_ids": []
+        },
+        "summary": {
+          "value": null,
+          "evidence_ids": []
+        },
         "methods": [],
         "datasets": [],
         "metrics": [],
@@ -68,10 +87,18 @@
       "payload": {
         "research_question": {
           "value": "引用了不属于本 Run 的证据",
-          "evidence_ids": ["99999999-9999-4999-8999-999999999999"]
+          "evidence_ids": [
+            "99999999-9999-4999-8999-999999999999"
+          ]
         },
-        "research_object": { "value": null, "evidence_ids": [] },
-        "summary": { "value": null, "evidence_ids": [] },
+        "research_object": {
+          "value": null,
+          "evidence_ids": []
+        },
+        "summary": {
+          "value": null,
+          "evidence_ids": []
+        },
         "methods": [],
         "datasets": [],
         "metrics": [],
@@ -86,9 +113,18 @@
       "expected": "rejected",
       "reject_reason": "返回了 Schema 之外的字段",
       "payload": {
-        "research_question": { "value": null, "evidence_ids": [] },
-        "research_object": { "value": null, "evidence_ids": [] },
-        "summary": { "value": null, "evidence_ids": [] },
+        "research_question": {
+          "value": null,
+          "evidence_ids": []
+        },
+        "research_object": {
+          "value": null,
+          "evidence_ids": []
+        },
+        "summary": {
+          "value": null,
+          "evidence_ids": []
+        },
         "methods": [],
         "datasets": [],
         "metrics": [],
@@ -111,7 +147,10 @@
       "finish_status": "stop",
       "expected": "accepted",
       "note": "没有可归纳主题是合法结果，不要求模型凑数",
-      "payload": { "topics": [], "unassigned_paper_ids": [] }
+      "payload": {
+        "topics": [],
+        "unassigned_paper_ids": []
+      }
     },
     {
       "name": "topics_multi_membership",
@@ -123,8 +162,12 @@
           {
             "name": "注意力机制",
             "description": "围绕注意力模块的设计与消融。",
-            "paper_ids": ["aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"],
-            "evidence_ids": ["11111111-1111-4111-8111-111111111111"]
+            "paper_ids": [
+              "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            ],
+            "evidence_ids": [
+              "11111111-1111-4111-8111-111111111111"
+            ]
           },
           {
             "name": "小样本学习",
@@ -133,7 +176,9 @@
               "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
               "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
             ],
-            "evidence_ids": ["22222222-2222-4222-8222-222222222222"]
+            "evidence_ids": [
+              "22222222-2222-4222-8222-222222222222"
+            ]
           }
         ],
         "unassigned_paper_ids": []
@@ -145,7 +190,9 @@
       "finish_status": "stop",
       "expected": "accepted",
       "note": "没有争议候选是合法结果",
-      "payload": { "disputes": [] }
+      "payload": {
+        "disputes": []
+      }
     },
     {
       "name": "disputes_same_side_rejected",
@@ -158,8 +205,14 @@
           {
             "left_paper_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
             "right_paper_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
-            "left_claim": { "value": "结论 A", "evidence_ids": [] },
-            "right_claim": { "value": "结论 B", "evidence_ids": [] },
+            "left_claim": {
+              "value": "结论 A",
+              "evidence_ids": []
+            },
+            "right_claim": {
+              "value": "结论 B",
+              "evidence_ids": []
+            },
             "conditions": {
               "research_question": "同一问题",
               "left_conditions": "原文未报告",
@@ -182,7 +235,6 @@
         "results": [
           {
             "evidence_id": "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
-            "rank": 1,
             "score": 0.9,
             "reason": "候选之外"
           }
@@ -198,13 +250,11 @@
         "results": [
           {
             "evidence_id": "11111111-1111-4111-8111-111111111111",
-            "rank": 1,
             "score": 0.87,
             "reason": "直接回答查询中的小样本设置"
           },
           {
             "evidence_id": "22222222-2222-4222-8222-222222222222",
-            "rank": 2,
             "score": 0.61,
             "reason": "提供方法背景"
           }
@@ -217,7 +267,11 @@
       "finish_status": "length",
       "expected": "rejected",
       "reject_reason": "输出被截断，不能提交半截正文",
-      "payload": { "section_key": "background", "title": "研究背景", "blocks": [] }
+      "payload": {
+        "section_key": "background",
+        "title": "研究背景",
+        "blocks": []
+      }
     },
     {
       "name": "verify_blocks_ok",
@@ -227,17 +281,19 @@
       "payload": {
         "blocks": [
           {
-            "block_id": "block-1",
+            "block_id": "00000000-0000-4000-8000-000000000001",
             "structure_ok": true,
             "support": "supported",
             "issues": [],
             "suggestion": null
           },
           {
-            "block_id": "block-2",
+            "block_id": "00000000-0000-4000-8000-000000000002",
             "structure_ok": true,
             "support": "uncertain",
-            "issues": ["现有证据只能支持较弱表述"],
+            "issues": [
+              "现有证据只能支持较弱表述"
+            ],
             "suggestion": "改为“初步显示”并补一条证据"
           }
         ]
@@ -266,6 +322,51 @@
       "provider_error": "balance_insufficient",
       "expected": "job_error",
       "job_error_code": "MODEL_BALANCE_INSUFFICIENT"
+    },
+    {
+      "name": "query_expand_ok",
+      "task_type": "query_expand",
+      "finish_status": "stop",
+      "expected": "accepted",
+      "payload": {
+        "queries": [
+          "attention"
+        ]
+      }
+    },
+    {
+      "name": "page_extract_ok",
+      "task_type": "page_extract",
+      "finish_status": "stop",
+      "expected": "accepted",
+      "payload": {
+        "elements": [
+          {
+            "element_type": "text",
+            "text": "Example page text",
+            "section": null
+          }
+        ]
+      }
+    },
+    {
+      "name": "review_section_ok",
+      "task_type": "review_section",
+      "finish_status": "stop",
+      "expected": "accepted",
+      "payload": {
+        "section_key": "background",
+        "title": "Background",
+        "blocks": [
+          {
+            "kind": "claim",
+            "text": "Example claim",
+            "evidence_ids": [
+              "11111111-1111-4111-8111-111111111111"
+            ]
+          }
+        ]
+      }
     }
   ]
 }

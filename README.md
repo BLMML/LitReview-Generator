@@ -2,7 +2,7 @@
 
 Django 5.2 + DRF + Celery + PostgreSQL + DeepSeek 的模块化单体后端。
 
-**这是骨架，不是完成品。** 项目结构、数据库模型、HTTP 路由表与公共基础层已经落地并跑通；
+**M03 基础层与 M04 任务 / 模型调用底座已实现，尚未形成完整业务产品。** 项目结构、数据库模型、HTTP 路由表与公共基础层已经落地并跑通；
 领域业务逻辑（上传解析、分析、检索、生成、核验、导出）尚未实现，
 对应入口会明确返回 `503 SERVICE_UNAVAILABLE` 并注明所属阶段，不会伪装成成功。
 
@@ -119,7 +119,8 @@ python .data/tools/check_prod_settings.py   # 用容器那套变量驱动 Django
 
 - `mock`：不产生任何网络请求。测试夹具见 `backend/tests/fixtures/llm_cases.json`。
 - `real`：必须显式设置，且同时提供 `DEEPSEEK_API_KEY` 与已核验价目，否则启动即失败。
-  正式（`production`）模式下真实调用失败**不会**静默退回模拟结果。
+  六个峰谷单价、价目版本、当年 UTC 日历和非零预算也必须齐备；真实调用失败**不会**静默退回模拟结果。
+  预留始终按峰价，结算读取请求发起时冻结的 `pricing_snapshot`。详见 [M04 实现与验收](docs/mvp/M04_实现与验收.md)。
 
 其他相关配置：`LLM_MAX_CONCURRENCY`（部署级全局上限，加 worker 绕不过）、
 `LLM_MAX_ATTEMPTS`（含最多一次输出格式修复）、`PROJECT_DEFAULT_BUDGET_USD`
@@ -135,21 +136,21 @@ python .data/tools/check_prod_settings.py   # 用容器那套变量驱动 Django
 cd backend
 python -m pytest                     # 全部
 python -m pytest tests/test_contract_auth.py -v
-ruff check backend                   # 静态检查
+ruff check .                         # 静态检查（当前位于 backend）
 python manage.py check               # Django 系统检查
 ```
 
-当前状态（`DATABASE_URL` 指向 PostgreSQL 时）：**41 passed, 47 skipped**。
-未设置 `DATABASE_URL` 时会回退 SQLite，`tests/test_postgres_constraints.py`
-的 **17 项整组跳过**，只剩 24 passed —— 这是刻意的：那 17 项断言的是
-行锁、部分唯一索引和并发受理，SQLite 不提供这些语义，跑出来的「通过」没有意义。
+当前状态（PostgreSQL，2026-09-21）：显式设置 `RUN_M04_REDIS_TEST=1` 后，
+**137 passed, 35 skipped**，包含真实 Redis 隔离队列 + Celery solo 测试 worker + mock 模型网关闭环。
+普通测试默认跳过该闭环，预期 **136 passed, 36 skipped**。
+M04 行锁、预算与恢复测试要求真实 PostgreSQL；SQLite 不能替代这些并发结论。
 
 ```bash
 # 只看 PostgreSQL 专有的并发与约束断言
 python -m pytest tests/test_postgres_constraints.py -v
 ```
 
-跳过的 47 条不是通过，而是把 docs/mvp/01 第 9 节要求的验收行为先写成显式 skip，
+剩余 35 条后续业务验收 skip 不是通过，而是把 docs/mvp/01 第 9 节要求的验收行为先写成显式 skip，
 避免把“没实现”伪装成“已通过”。实现对应阶段后逐条打开即可。
 
 ### 端到端冒烟（真实进程）
@@ -206,9 +207,10 @@ python backend/tests/walkthrough_http.py
 | `common`（http / auth / storage / idempotency / locking / models） | ✅ 可用 | envelope、分页、CSRF、统一 401/404、暂存与归档、幂等重放、Project 行锁与 fencing |
 | `accounts` | ✅ 可用 | csrf / login / logout / me |
 | `projects` | ✅ 可用 | 列表、创建、详情、PATCH（乐观锁 + corpus_revision 规则） |
-| `jobs` | 🟡 部分 | 模型与受理 / 取消 / 重试 / 租约 fencing 已实现；领域分发目标尚未实现 |
+| `jobs` | ✅ M04 已实现 | 幂等受理、投递补偿、进度、取消、重试、心跳、租约 fencing 与失联恢复；M05+ 领域处理器待实现 |
+| `llm` | ✅ M04 已实现 | mock / 真实适配器、结构校验、重试、私有产物、缓存、全局并发、预算与峰谷结算；付费 API 未实测 |
 | `literature` | 🟡 部分 | 只读接口与 PDF 下载已接好；上传与 arXiv 导入未实现 |
-| `parsing` / `analysis` / `retrieval` / `reviews` / `llm` | 🟡 模型与签名就绪 | 数据库模型、路由、序列化器、函数签名与事务边界注释齐全；业务实现待补 |
+| `parsing` / `analysis` / `retrieval` / `reviews` | 🟡 模型与签名就绪 | 数据库模型、路由、序列化器、函数签名与事务边界注释齐全；业务实现待补 |
 | `prompts`（7 个模板） | ✅ 已交付 | `prompt_loader` 可用：分段加载、参数渲染、版本哈希 |
 | `tests` | 🟡 部分 | 契约 / 认证 / 权限测试可跑；其余按阶段 skip |
 | `frontend` | ⛔ 未开始 | 本次范围只做后端 |
@@ -276,8 +278,22 @@ python backend/tests/walkthrough_http.py
 
 | 组件 | 位置 | 说明 |
 | --- | --- | --- |
-| PostgreSQL 17.9 | `C:\Users\Public\review-mvp-pg` | 免安装二进制 + 数据目录，只监听 127.0.0.1:5432 |
+| PostgreSQL 17.9 | 自动探测的 ASCII 路径，见下 | 免安装二进制 + 数据目录，只监听 127.0.0.1:5432 |
 | Redis 5.0.14 | `.data/redis` | Windows 移植版，只监听 127.0.0.1:6379，**关闭持久化** |
+
+PostgreSQL 的根目录**不写死**，按以下优先级自动探测（先找已有安装，找不到才新建）：
+
+1. `--root <路径>` 命令行参数（给了就只看这一个）
+2. `PG_ASCII_ROOT` 环境变量
+3. `D:\review-mvp-pg`
+4. `%PUBLIC%\review-mvp-pg`
+
+同一批候选里，**集群与安装都完整**的位置优先于只有二进制的半成品，
+这样搬家搬到一半时也不会选错。想知道当前选中了哪里：
+
+```powershell
+.venv\Scripts\python.exe .data\tools\pg_ctl_local.py status
+```
 
 管理命令（**必须在你自己的终端跑，不要在受限沙箱里跑**）：
 
@@ -285,7 +301,7 @@ python backend/tests/walkthrough_http.py
 .venv\Scripts\python.exe .data\tools\pg_ctl_local.py init|start|stop|status
 .venv\Scripts\python.exe .data\tools\redis_local.py   start|stop|status
 
-# 换到别的盘（例如 D 盘）
+# 显式指定位置（例如把 PostgreSQL 放到 D 盘）
 .venv\Scripts\python.exe .data\tools\pg_ctl_local.py init --root D:\review-mvp-pg
 ```
 
@@ -293,7 +309,7 @@ python backend/tests/walkthrough_http.py
 写进 `.env`。写完 `.env` 后本地测试自动从 SQLite 切到 PostgreSQL，代码无需改动。
 
 已验证（2026-09-21）：迁移在 PostgreSQL 上从空库全部应用；
-**41 passed / 47 skipped**，其中 17 项是 PostgreSQL 专有的并发与约束断言；
+**137 passed / 35 skipped**（启用 M04 Redis 集成验证），包含 PostgreSQL 并发与约束断言；
 Redis 连通；worker 消费投递的任务；beat 每 30 秒触发 `reconcile_jobs` 并被 worker 执行。
 
 仍未验证：`compose.yaml` 与 `deploy/backend.Dockerfile` 只过了 56 项静态检查，
@@ -305,7 +321,8 @@ Redis 连通；worker 消费投递的任务；beat 每 30 秒触发 `reconcile_j
 
 initdb 后期自举时会生成一条 `COPY` 命令，把「安装目录下 `share/sql_features.txt`
 的完整路径」写进 SQL，而服务器要求这条 SQL 是合法 UTF8。路径里只要有中文
-（例如用户名 `别浪慢慢来`），字节序列就不是 UTF8：
+（例如 Windows 用户名是中文时，`C:\Users\<中文名>\...` 就带上了非 ASCII 字节），
+字节序列就不是 UTF8：
 
 ```
 performing post-bootstrap initialization ...
@@ -319,9 +336,9 @@ FATAL:  invalid byte sequence for encoding "UTF8": 0xb1
 `.data/tools/pg_ctl_local.py` 已经内置了这个处理：检测到安装路径非 ASCII 时
 自动复制 `bin`/`lib`/`share` 到 `<root>\pgsql` 再初始化。
 
-### 相对 docs/mvp/01 第 8.1 节新增的环境变量
+### 已回填 docs/mvp/01 第 8.1 节的部署变量
 
-以下变量是在实现部署配置时补的，需要回填进 01 的变量清单：
+以下四项已于 2026-09-21 随 M04 回填；六个峰谷单价及日历配置也已同步：
 
 | 变量 | 用途 |
 | --- | --- |
