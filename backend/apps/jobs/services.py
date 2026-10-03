@@ -103,6 +103,8 @@ def accept_job(
     kind: str,
     payload: Mapping[str, Any],
     idempotency: Any | None = None,
+    *,
+    result: Mapping[str, Any] | None = None,
 ) -> AcceptedJob:
     """统一受理入口。
 
@@ -113,6 +115,10 @@ def accept_job(
     必须在 Project 行锁内完成：幂等查找 → 空闲校验 → 冻结输入 → 创建 Job。
     传入 key 或 Claim 时由本服务在同一事务写幂等记录；提交后自动投递队列。
     领域调用方应在外层同一事务内预建资源，不得重复记录幂等响应或重复 dispatch。
+
+    `result` 供立即就能确定的初始结果使用（例如 `import_arxiv` 的逐项 pending 账本）。
+    契约（`03` 第 2.2 节）要求 `Job.result.items` 在**受理时**就存在，
+    只在 `frozen_input` 里写账本不满足接口约定。
     """
     if kind not in JOB_KIND_RESOURCE_TYPE:
         raise api_error("VALIDATION_ERROR", "不支持的任务类型")
@@ -152,6 +158,7 @@ def accept_job(
             frozen_input=frozen_input,
             input_hash=payload_fingerprint(frozen_input),
             progress=default_progress(),
+            result=dict(result) if result is not None else None,
         )
 
         result = AcceptedJob(job_id=job.id, resource_type=resource_type, resource_id=resource_id)
@@ -505,7 +512,12 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
             input_hash=previous.input_hash,
             retry_of_job=previous,
             attempt=latest_attempt + 1,
-            progress=default_progress(),
+            progress=_inherited_progress(previous),
+            # 账本（如 arXiv 导入的逐项结果）沿 retry_of 链向上取最近一次已有账本的尝试：
+            # 中间可能存在「排队期间被取消、从未执行」的尝试，它的 result 永远是 null。
+            # 不继承会让成功项被重置为 pending、已冻结的具体版本丢失。
+            # 注意这里复制的是**账本**，不代表本次尝试已经成功——终态仍由执行结果决定。
+            result=_inherited_result(previous),
         )
         result = AcceptedJob(
             job_id=new_job.id,
@@ -516,6 +528,56 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
             record_claim(claim, status_code=202, body=result.as_dto(), project=locked, job=new_job)
         transaction.on_commit(lambda: dispatch(new_job))
         return result
+
+
+def _ledger_of(job: Job) -> list[dict[str, Any]]:
+    """作业的逐项账本；没有账本返回空列表。"""
+    items = (job.result or {}).get("items")
+    return [dict(item) for item in items] if isinstance(items, list) else []
+
+
+def _inherited_result(previous: Job) -> dict[str, Any] | None:
+    """新尝试应继承的账本：`previous` 自身或其最近有账本的祖先。
+
+    继承是契约要求（03 第 2.2 节：重试复制上次账本，只补 pending/failed 项）。
+    """
+    for candidate in (previous, *_ancestors(previous)):
+        items = _ledger_of(candidate)
+        if items:
+            return {"items": items}
+    return None
+
+
+def _inherited_progress(previous: Job) -> dict[str, Any]:
+    """进度起点：已完结的账本项数，避免重试后进度从 0 重新数。"""
+    progress = default_progress()
+    for candidate in (previous, *_ancestors(previous)):
+        items = _ledger_of(candidate)
+        if not items:
+            continue
+        finished = sum(
+            1 for item in items if item.get("status") in ("imported", "duplicate")
+        )
+        progress = {**progress, "completed": finished, "total": len(items), "unit": "paper"}
+        break
+    return progress
+
+
+def _ancestors(job: Job, *, limit: int = 20) -> list[Job]:
+    """沿 retry_of 链向上取祖先尝试；限步与去环防止脏数据把查询拖死。"""
+    chain: list[Job] = []
+    seen = {job.pk}
+    current = job
+    for _ in range(limit):
+        if current.retry_of_job_id is None:
+            break
+        parent = Job.objects.filter(pk=current.retry_of_job_id).first()
+        if parent is None or parent.pk in seen:
+            break
+        seen.add(parent.pk)
+        chain.append(parent)
+        current = parent
+    return chain
 
 
 def _check_retry_resource(job: Job) -> None:

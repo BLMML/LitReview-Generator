@@ -2,9 +2,9 @@
 
 Django 5.2 + DRF + Celery + PostgreSQL + DeepSeek 的模块化单体后端。
 
-**M03 基础层与 M04 任务 / 模型调用底座已实现，尚未形成完整业务产品。** 项目结构、数据库模型、HTTP 路由表与公共基础层已经落地并跑通；
-领域业务逻辑（上传解析、分析、检索、生成、核验、导出）尚未实现，
-对应入口会明确返回 `503 SERVICE_UNAVAILABLE` 并注明所属阶段，不会伪装成成功。
+**M03 基础层、M04 任务 / 模型调用底座与 M05 文献接入已实现，尚未形成完整业务产品。**
+PDF 上传、元数据编辑、授权下载与 arXiv 导入已经落地；M05 保持「待验收」，仍需人工抽检。
+页级解析、分析、检索、生成、核验、导出尚未实现，对应入口明确返回 `503 SERVICE_UNAVAILABLE` 并注明所属阶段。
 
 设计与契约文档在 [`docs/mvp/`](docs/mvp/README.md)：
 
@@ -117,7 +117,7 @@ python .data/tools/check_prod_settings.py   # 用容器那套变量驱动 Django
 
 由 `LLM_MODE` 控制，**默认 `mock`**：
 
-- `mock`：不产生任何网络请求。测试夹具见 `backend/tests/fixtures/llm_cases.json`。
+- `mock`：模型调用使用本地替身，不访问模型供应商；不控制 arXiv 导入是否出网。测试夹具见 `backend/tests/fixtures/llm_cases.json`。
 - `real`：必须显式设置，且同时提供 `DEEPSEEK_API_KEY` 与已核验价目，否则启动即失败。
   六个峰谷单价、价目版本、当年 UTC 日历和非零预算也必须齐备；真实调用失败**不会**静默退回模拟结果。
   预留始终按峰价，结算读取请求发起时冻结的 `pricing_snapshot`。详见 [M04 实现与验收](docs/mvp/M04_实现与验收.md)。
@@ -140,18 +140,29 @@ ruff check .                         # 静态检查（当前位于 backend）
 python manage.py check               # Django 系统检查
 ```
 
-当前状态（PostgreSQL，2026-09-21）：显式设置 `RUN_M04_REDIS_TEST=1` 后，
-**137 passed, 35 skipped**，包含真实 Redis 隔离队列 + Celery solo 测试 worker + mock 模型网关闭环。
-普通测试默认跳过该闭环，预期 **136 passed, 36 skipped**。
-M04 行锁、预算与恢复测试要求真实 PostgreSQL；SQLite 不能替代这些并发结论。
+当前状态（PostgreSQL，2026-09-29）：设置 `LLM_MODE=mock`、`RUN_M04_REDIS_TEST=1` 后，
+**258 passed, 27 skipped**，包含真实 Redis 隔离队列 + Celery solo 测试 worker + mock 模型网关闭环。
+三轮独立复现共 **17 项通过**；Ruff、Django、迁移一致性与依赖检查全部通过。
+默认跳过 Redis 闭环时预期 **257 passed, 28 skipped**。
+历史基线：第三轮修复方实测 255，第二轮 243，本轮补入守卫测试后为 258，
+详见 [M05 实现与验收 §4.4](docs/mvp/M05_实现与验收.md)。
+M04 的行锁 / 预算 / 恢复与 M05 的并发上传去重、容量上限测试都要求真实 PostgreSQL；
+SQLite 不能替代这些并发结论。
 
 ```bash
 # 只看 PostgreSQL 专有的并发与约束断言
 python -m pytest tests/test_postgres_constraints.py -v
 ```
 
-剩余 35 条后续业务验收 skip 不是通过，而是把 docs/mvp/01 第 9 节要求的验收行为先写成显式 skip，
-避免把“没实现”伪装成“已通过”。实现对应阶段后逐条打开即可。
+剩余 27 条后续业务验收 skip 不是通过，而是把 docs/mvp/01 第 9 节要求的验收行为先写成显式 skip，
+避免把“没实现”伪装成“已通过”。实现对应阶段后逐条打开即可：
+
+| 跳过来源 | 条数 | 所属阶段 |
+| --- | --- | --- |
+| `test_run_retrieval.py` | 11 | M07 / M08 分析、主题、争议、检索 |
+| `test_review_export.py` | 13 | M10 / M11 生成、版本、核验、导出 |
+| `test_literature_parsing.py` | 3 | M06 页级证据、复杂页显式失败、视觉转录默认未核验 |
+| `test_m04_worker.py` | 1 | 需 `RUN_M04_REDIS_TEST=1` 的独立 Redis 队列验证 |
 
 ### 端到端冒烟（真实进程）
 
@@ -197,6 +208,43 @@ python backend/tests/walkthrough_http.py
 **未实现的端点在入参校验之后才返回 503** —— 也就是说 `POST /runs` 缺幂等键时
 先得到 400，这是对的：契约要求的校验不因为没有业务实现就跳过。
 
+### 文献接入走查（M05，真实 multipart 上传与二进制下载）
+
+`walkthrough_papers_http.py` 走通 M05 的完整闭环。它用真实 multipart 上传与真实 HTTP
+二进制下载，因此覆盖了 pytest 里不容易复现的部分：真实 WSGI 下的报文头编码、
+multipart 边界、下载字节一致性与 RFC 5987 文件名。
+
+准备用户与起服务的步骤同上，然后：
+
+```bash
+# 需要 worker 才能看到 arXiv 导入从受理走到终态（可选）
+cd backend
+python -m celery -A config worker --pool=solo --loglevel=INFO
+
+# 回到仓库根
+python backend/tests/walkthrough_papers_http.py
+```
+
+历史走查已实测通过（52 项；本轮修复未重跑真实 arXiv 导入），覆盖：上传 201 与 PaperDTO 全字段、`title` 缺省取文件名、
+`file_sha256` 与本地一致、新增文献递增 `corpus_revision`、同文件重复上传仍 201 且带
+`X-Resource-Reused: true` 且不覆盖既有元数据、同键同体重放返回同资源、
+同键异体 409、缺 `file` / 缺幂等键 400 并点名、非 PDF 422、元数据编辑与
+`year`/`authors` 校验、过期 `expected_version` 409 且带回 `current_version`、
+内容相同不涨版本、`included` 过滤、未知查询参数 400、下载字节与哈希一致、
+`Content-Disposition` 的 RFC 5987 编码、跨用户详情 / 编辑 / 上传 / 下载 / 列表一律 404、
+arXiv 拒绝 URL 形式 ID、导入受理 202 并轮询到终态且逐项账本结构合法。
+
+**该脚本会真实访问 arXiv**（服务端白名单内的 `export.arxiv.org` 与 `arxiv.org`），
+会下载真实 PDF 并写入私有存储。不想出网时只跑到第 7 节即可，或跳过第 8 节。
+
+> 2026-09-29 前两轮独立复核共提出 14 项边界问题（旧 worker 失去租约仍可写入、忙碌项目仍接受上传、
+> 重放被后续编辑污染、下载读完整包才判上限、历史资产按 `text/html` 下载、租约过期仍可改写账本、
+> 满容量误拒重复导入、总时限不含重定向等），当时补入 20 条回归用例。
+> 第三轮进一步发现账本校验与 UPDATE 之间释放锁、网络阻塞不能被总时限及时中断；
+> 本轮把账本校验与 UPDATE 放进同一事务，并用 `AsyncClient` 与 `asyncio.timeout_at` 取消到期的网络等待。
+> 本轮使用模型 mock 和 HTTP 替身；历史证据与本轮复验分开记录，见
+> [第三轮复核及修复结果](docs/mvp/M05_第三轮复核_2026-09-29.md)。
+
 ---
 
 ## 四、骨架完成度
@@ -207,10 +255,11 @@ python backend/tests/walkthrough_http.py
 | `common`（http / auth / storage / idempotency / locking / models） | ✅ 可用 | envelope、分页、CSRF、统一 401/404、暂存与归档、幂等重放、Project 行锁与 fencing |
 | `accounts` | ✅ 可用 | csrf / login / logout / me |
 | `projects` | ✅ 可用 | 列表、创建、详情、PATCH（乐观锁 + corpus_revision 规则） |
-| `jobs` | ✅ M04 已实现 | 幂等受理、投递补偿、进度、取消、重试、心跳、租约 fencing 与失联恢复；M05+ 领域处理器待实现 |
+| `jobs` | ✅ M04 已实现 | 幂等受理、投递补偿、进度、取消、重试、心跳、租约 fencing 与失联恢复；M05 导入处理器已接通，M06+ 待实现 |
 | `llm` | ✅ M04 已实现 | mock / 真实适配器、结构校验、重试、私有产物、缓存、全局并发、预算与峰谷结算；付费 API 未实测 |
-| `literature` | 🟡 部分 | 只读接口与 PDF 下载已接好；上传与 arXiv 导入未实现 |
-| `parsing` / `analysis` / `retrieval` / `reviews` | 🟡 模型与签名就绪 | 数据库模型、路由、序列化器、函数签名与事务边界注释齐全；业务实现待补 |
+| `literature` | 🟡 M05 已实现，待验收 | 上传校验与去重、元数据编辑与纳入开关、授权 PDF 下载、arXiv 受理与逐项账本、部分失败保留与重试补项；仍需人工抽检 |
+| `parsing` | 🟡 部分 | PDF 结构检查（大小 / 页数 / 加密 / 损坏）已随 M05 实现；页级文本提取、证据片段与页面渲染属 M06 |
+| `analysis` / `retrieval` / `reviews` | 🟡 模型与签名就绪 | 数据库模型、路由、序列化器、函数签名与事务边界注释齐全；业务实现待补 |
 | `prompts`（7 个模板） | ✅ 已交付 | `prompt_loader` 可用：分段加载、参数渲染、版本哈希 |
 | `tests` | 🟡 部分 | 契约 / 认证 / 权限测试可跑；其余按阶段 skip |
 | `frontend` | ⛔ 未开始 | 本次范围只做后端 |
@@ -227,6 +276,12 @@ python backend/tests/walkthrough_http.py
 - 任务租约用单调递增的 `lease_token` 做 fencing，旧 worker 迟到也无法提交结果。
 - 金额统一 `Decimal` + `numeric(18,8)`，未知用量写 `null` 而不是 `0`。
 - 日志过滤器兜底脱敏认证头、Cookie 与 Key。
+- 同项目同 SHA256 只保留一篇文献，由唯一约束兜底；重复上传返回既有资源且不递增语料版本。
+- 上传体积上限在暂存流中即时生效，超大文件不会先落满磁盘再被拒绝。
+- PDF 结构检查只认文件内容，不认扩展名；加密、损坏、超页数分别映射 422 / 413。
+- 论文原文一律经授权路由读取，下载响应头**不含任何磁盘路径**，非 ASCII 文件名按 RFC 5987 编码。
+- arXiv 地址由服务端白名单构造，**每一跳重定向都重新校验主机**，不接受用户提供的 URL。
+- arXiv 响应按不可信输入解析：拒绝任何带 `<!DOCTYPE` 的响应，挡掉 XXE 与实体膨胀。
 
 ---
 

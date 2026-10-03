@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 import threading
+import uuid
 
 import pytest
 from django.db import connections
 from django.db.utils import IntegrityError
+
+from apps.common.http import ApiError
 
 pytestmark = pytest.mark.django_db(transaction=True)
 
@@ -274,3 +277,159 @@ def test_row_lock_serializes_project_writes(project_a, user_a):
 
     assert observed == ["locked"]
     assert waited >= 0.5, f"第二个事务没有被阻塞（等待 {waited:.2f}s），行锁可能没生效"
+
+
+# ── T03 / T05：并发上传与容量（M05）────────────────────────────
+def _upload_in_thread(user_id, project_id, payload, *, title=None):
+    """在独立连接上跑一次真实上传，返回 (结果标记, paper_id)。"""
+    from django.contrib.auth import get_user_model
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    from apps.common.auth import ActorContext
+    from apps.common.idempotency import parse_idempotency_key
+    from apps.literature.services import upload_pdf
+
+    try:
+        user = get_user_model().objects.get(pk=user_id)
+        actor = ActorContext(user=user, request_id="req_concurrent")
+        uploaded = SimpleUploadedFile("same.pdf", payload, content_type="application/pdf")
+        result = upload_pdf(
+            actor, project_id, uploaded, {"title": title}, parse_idempotency_key(str(uuid.uuid4()))
+        )
+        return ("ok", result.paper_id)
+    except ApiError as exc:
+        return (exc.code, None)
+    except Exception as exc:  # noqa: BLE001
+        return (f"error:{type(exc).__name__}", None)
+    finally:
+        # 只关本线程的连接；close_all() 的跨线程行为在不同 Django 版本间不一致
+        connections["default"].close()
+
+
+def test_concurrent_same_file_upload_creates_one_paper(project_a, user_a):
+    """两个连接同时上传同一份文件：唯一约束必须收敛成一篇文献。
+
+    SQLite 会整体串行化写入，掩盖真实竞争，因此该结论只在 PostgreSQL 上有效。
+    """
+    from tests.conftest import make_pdf_bytes
+
+    from apps.literature.models import Paper
+
+    payload = make_pdf_bytes(2)
+    barrier = threading.Barrier(2, timeout=15)
+
+    def attempt():
+        barrier.wait()
+        return _upload_in_thread(user_a.pk, project_a.pk, payload)
+
+    results: list[tuple[str, str | None]] = []
+    lock = threading.Lock()
+
+    def run():
+        outcome = attempt()
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=run) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert len(results) == 2, f"线程未正常结束：{results}"
+    # 去重语义：两次都「成功」，但只落一篇文献
+    assert [tag for tag, _ in results] == ["ok", "ok"], f"并发上传未收敛：{results}"
+    assert Paper.objects.filter(project=project_a).count() == 1
+    assert len({paper_id for _, paper_id in results}) == 1, "两次上传必须返回同一篇文献"
+
+
+def test_concurrent_uploads_respect_capacity_limit(project_a, user_a, settings):
+    """容量上限在项目行锁内判定：并发上传不得突破 30 篇。
+
+    上限压到 2，用 4 个并发连接抢；无论调度顺序如何，最终都只能有 2 篇。
+    """
+    from tests.conftest import make_pdf_bytes
+
+    from apps.literature.models import Paper
+
+    settings.MVP_LIMITS = {**settings.MVP_LIMITS, "PAPERS_PER_PROJECT_MAX": 2}
+    payloads = [make_pdf_bytes(pages) for pages in range(1, 5)]
+    barrier = threading.Barrier(4, timeout=20)
+
+    results: list[tuple[str, str | None]] = []
+    lock = threading.Lock()
+
+    def run(payload):
+        barrier.wait()
+        outcome = _upload_in_thread(user_a.pk, project_a.pk, payload)
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=run, args=(payload,)) for payload in payloads]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert len(results) == 4, f"线程未正常结束：{results}"
+    accepted = [tag for tag, _ in results if tag == "ok"]
+    rejected = [tag for tag, _ in results if tag == "PAPER_LIMIT_EXCEEDED"]
+    assert len(accepted) == 2, f"容量上限被突破：{results}"
+    assert len(rejected) == 2, f"超限没有被拒绝：{results}"
+    assert Paper.objects.filter(project=project_a).count() == 2
+
+
+def test_concurrent_paper_patch_accepts_only_one_writer(project_a, user_a):
+    """双端基于同一 version 保存，只能有一个成功（T11 乐观锁）。"""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+    from tests.conftest import make_pdf_bytes
+
+    from apps.common.auth import ActorContext
+    from apps.common.idempotency import parse_idempotency_key
+    from apps.literature.models import Paper
+    from apps.literature.services import upload_pdf
+
+    actor = ActorContext(user=user_a, request_id="req_test")
+    uploaded = upload_pdf(
+        actor,
+        project_a.pk,
+        SimpleUploadedFile("lock.pdf", make_pdf_bytes(1), content_type="application/pdf"),
+        {},
+        parse_idempotency_key(str(uuid.uuid4())),
+    )
+    paper = Paper.objects.get(pk=uploaded.paper_id)
+
+    barrier = threading.Barrier(2, timeout=15)
+    results: list[str] = []
+    lock = threading.Lock()
+
+    def run(title: str) -> None:
+        from django.contrib.auth import get_user_model
+
+        from apps.common.auth import ActorContext as Ctx
+        from apps.literature.services import update_paper as update
+
+        try:
+            barrier.wait()
+            user = get_user_model().objects.get(pk=user_a.pk)
+            update(Ctx(user=user, request_id="req_c"), paper.pk, 1, {"title": title})
+            outcome = "ok"
+        except ApiError as exc:
+            outcome = exc.code
+        except Exception as exc:  # noqa: BLE001
+            outcome = f"error:{type(exc).__name__}"
+        finally:
+            connections["default"].close()
+        with lock:
+            results.append(outcome)
+
+    threads = [threading.Thread(target=run, args=(f"并发标题{index}",)) for index in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert sorted(results) == ["VERSION_CONFLICT", "ok"], f"乐观锁未生效：{results}"
+    paper.refresh_from_db()
+    assert paper.version == 2
+    assert paper.title in {"并发标题0", "并发标题1"}

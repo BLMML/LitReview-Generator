@@ -1,7 +1,7 @@
 # 交接说明（给接手的 DSH 会话）
 
 > 这份文档面向**接手的 AI 会话**，不是项目介绍。项目介绍看 [`README.md`](README.md)。
-> 生成时间：2026-09-21。
+> 生成时间：2026-09-21｜**最近更新：2026-09-29（M05 第三轮问题修复，保留待验收）**。
 
 ## 0. 先读这三样
 
@@ -29,8 +29,8 @@ ruff/pytest/celery 控制台脚本、pytest rootdir、Celery 任务发现都正�
 
 ## 2. 现在是什么状态
 
-**已完成**：M03「搭建项目骨架与统一响应」的验收产物——`common/accounts/projects`、
-登录与 CSRF、统一错误 envelope、数据库迁移、依赖锁文件、配置示例、两账号项目隔离验证。
+**已实现**：M03「项目骨架与统一响应」、M04「任务与模型调用底座」、
+**M05「文献接入与文件授权」（2026-09-29）**。M04 / M05 的人工签收仍为「待验收」。
 
 **已实现**：
 
@@ -40,22 +40,43 @@ ruff/pytest/celery 控制台脚本、pytest rootdir、Celery 任务发现都正�
 - 43 条 HTTP 路由（按 `03` 挂载，无尾斜杠）
 - M04 `jobs` 幂等受理 / 取消 / 重试 / 进度 / 心跳 / 租约 fencing / 失联恢复；
   `llm` mock 与真实适配器、结构校验、预算、全局并发、峰谷快照结算、缓存与私有产物
+- M05 `literature` 上传校验与去重、元数据编辑与纳入开关、授权 PDF 下载、
+  arXiv 受理与逐项账本、部分失败保留与重试补项；`arxiv` 客户端（限流 / 重定向逐跳校验 /
+  大小上限 / XXE 防护）；`parsing.pdf` 的 PDF 结构检查（大小 / 页数 / 加密 / 损坏）
 - `llm/prompt_loader`（分段、参数渲染、版本哈希）
 - `prompts/` 下 7 个提示词模板
 
 **未实现**（调用时返回 `503 SERVICE_UNAVAILABLE` 并注明所属阶段，不会伪装成成功）：
-`literature` 上传与 arXiv 导入、`parsing`、`analysis`、`retrieval`、`reviews`。
+`parsing` 的页级文本提取 / 证据片段 / 页面渲染、`analysis`、`retrieval`、`reviews`。
 
-**测试**：启用 `RUN_M04_REDIS_TEST=1` 实测 `137 passed, 35 skipped`；默认不启用时预期 `136 passed, 36 skipped`。
-35 条是 M05+ 的待实现行为；额外 1 条是需显式启用的 Redis 闭环。skip **不是通过**。
-`llm.0002_model_call_gate_and_slot` 已应用到本机 PostgreSQL。详见 [M04 实现与验收](docs/mvp/M04_实现与验收.md)。
+**本轮测试**：`LLM_MODE=mock`、`RUN_M04_REDIS_TEST=1`，实测 **258 passed, 27 skipped**；
+默认跳过 Redis 闭环时预期 257 passed, 28 skipped。
+三轮独立复现共 17 项通过，Ruff、Django、迁移一致性与依赖检查全部通过。
+历史基线：第三轮修复方实测 255，第二轮 243，接手核对补入守卫测试后为 258，
+详见 [M05 实现与验收 §4.4](docs/mvp/M05_实现与验收.md)。
+27 条是 M06+ 的待实现行为；额外 1 条是需显式启用的 Redis 闭环。skip **不是通过**。
+`llm.0002_model_call_gate_and_slot` 已应用到本机 PostgreSQL。
+M04 详见 [M04 实现与验收](docs/mvp/M04_实现与验收.md)，
+M05 详见 [M05 实现与验收](docs/mvp/M05_实现与验收.md)；
+M05 的独立复核与修复对照见
+[M05 复核问题清单](docs/mvp/M05_复核问题清单_2026-09-29.md) 与
+[M05 第二轮复核](docs/mvp/M05_第二轮复核_2026-09-29.md)，最终两项修复见
+[M05 第三轮复核](docs/mvp/M05_第三轮复核_2026-09-29.md)。
 
 **未验证**：`compose.yaml` 与 `deploy/backend.Dockerfile` 只过了 56 项静态检查
 （`.data/tools/validate_deploy.py`），**没有真实 build / up 过**（本机无 Docker）。
 有 Docker 后跑 `python deploy/verify_stack.py`。
 
 **待人工确认**：M01、M02 的其余决策；本次用户已采纳价格配置清单第 14、15 项。
-**M04 状态**：代码及替身 / 本机集成测试完成，付费 API 冒烟未执行。M05 及其后待实现。
+**M04 状态**：代码及替身 / 本机集成测试完成，付费 API 冒烟未执行。
+**M05 状态**：文献接入已实现，三轮复核共 19 项问题均已有回归覆盖。
+第三轮的两项残留问题已补齐代码并经接手方独立核对确认：
+账本检查与 UPDATE 在同一事务中持有 Job 锁；下载以异步绝对截止时间取消限流、重定向、响应头和正文等待。
+核对同时发现第三轮「账本并发」复现用例的断言被结构性关闭（回退修复仍然通过），
+已在 `tests/test_m05_review_regressions.py` 补入可判定的行锁探测守卫并双向验证。
+历史记录包含真实 arXiv 导入；接手核对时以新的异步下载路径重跑过一次真实导入并成功，
+全程无模型调用。
+PDF 难例抽检与真实语料仍属 M02 人工项，M05 保持「待验收」。
 
 ## 3. 常用命令
 
@@ -69,7 +90,7 @@ cd 'D:\LitReview Generator'
 # 测试与检查
 cd backend
 ..\.venv\Scripts\python.exe manage.py check
-..\.venv\Scripts\python.exe -m pytest -q                      # 默认预期 136 passed, 36 skipped
+..\.venv\Scripts\python.exe -m pytest -q                      # 实际结果见 M05 验收记录
 ..\.venv\Scripts\python.exe -m pytest tests\test_postgres_constraints.py -v
 ..\.venv\Scripts\ruff.exe check . ..\deploy
 
@@ -148,12 +169,13 @@ pytest 的断言重写缓存（`.pyc`）里嵌着**源码绝对路径**，而 ro
 ## 5. 下一步该做什么
 
 按 `05` 的关键路径 `M01 → M03 → M04/M05 → M06 → M07 → M08/M09 → M10 → M11 → M13 → M14/M15 → M16`，
-M03 已完成，M04 代码已实现，接下来是 **M05：实现文献接入与文件授权**。
+M03—M05 的代码已实现，接下来是 **M06：实现解析与证据账本**；M05 的人工签收继续按验收清单执行。
 
-1. 完成 PDF 上传与文件授权，覆盖重复文件、大小限制、跨项目访问。
-2. 接通 arXiv 导入任务，复用 M04 `accept_job`；该函数负责记录幂等响应并在事务提交后投递，不要再次投递。
-3. 领域 worker 接收 `ExecutionContext`，在短事务中写状态，事务外调用模型 / 网络；用同一 context 提交进度与终态。
-4. 用真实 PostgreSQL 跑 M05 测试，再进行带登录态 HTTP 验证。
+1. 依据 `01` §4.3 实现 `parsing.pdf.extract_pages` / `render_page`，保留原文、页码、文本和明确的失败原因。
+2. 实现 `parsing.evidence` 与证据读取授权，让每条证据可回看所属论文的原页；不承诺句级坐标。
+3. 复杂页辅助处理沿用 M04 网关与预算规则，记录识别来源和不确定项；继续使用模型 mock 开发，不自动标记人工核验。
+4. 打开 `test_literature_parsing.py` 剩余 3 条 M06 验收项，并用 M02 提供的真实难例进行人工对照。
+5. 保留本轮账本并发与下载取消回归；网络请求在数据库事务外，业务写入与执行资格校验在同一短事务内。
 
 M04 的真实付费 API 冒烟仍需已核验的价格、日历、密钥与人工确认的预算；当前保持 mock。
 
@@ -171,7 +193,7 @@ cd 'D:\LitReview Generator'
 .venv\Scripts\python.exe .data\tools\pg_ctl_local.py status   # 期望「状态：运行中」
 .venv\Scripts\python.exe .data\tools\redis_local.py status   # 期望「状态：运行中」
 cd backend
-..\.venv\Scripts\python.exe -m pytest -q                     # 默认预期 136 passed, 36 skipped
+..\.venv\Scripts\python.exe -m pytest -q                     # 实际结果见 M05 验收记录
 ```
 
 若 PostgreSQL 未运行：`.venv\Scripts\python.exe .data\tools\pg_ctl_local.py start`。

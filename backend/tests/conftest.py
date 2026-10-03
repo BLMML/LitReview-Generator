@@ -94,15 +94,28 @@ def api_client():
 
 
 @pytest.fixture
-def client_a(api_client, user_a: User):
-    api_client.force_login(user_a)
-    return api_client
+def client_a(user_a: User):
+    """用户 A 的独立客户端。
+
+    刻意不复用 `api_client`：APIClient 实例内部保存当前登录身份，
+    两个账号共用一个实例时后登录的会覆盖前一个，
+    「跨用户 404」这类断言就会假通过或假失败。
+    """
+    from rest_framework.test import APIClient
+
+    client = APIClient()
+    client.force_login(user_a)
+    return client
 
 
 @pytest.fixture
-def client_b(api_client, user_b: User):
-    api_client.force_login(user_b)
-    return api_client
+def client_b(user_b: User):
+    """用户 B 的独立客户端；与 client_a 互不影响。"""
+    from rest_framework.test import APIClient
+
+    client = APIClient()
+    client.force_login(user_b)
+    return client
 
 
 @pytest.fixture
@@ -116,3 +129,50 @@ def csrf_client():
 @pytest.fixture
 def api_v1() -> str:
     return "/api/v1"
+
+
+# ── 真实 PDF 夹具（M05 上传校验用）────────────────────────────
+def make_pdf_bytes(pages: int = 1, *, encrypt: str | None = None) -> bytes:
+    """用 pypdf 生成结构合法的真 PDF；可指定页数与加密口令。
+
+    刻意不用极小的手写模板：上传校验必须面对真实解析器行为，
+    手写字节串容易在「合法」与「损坏」之间给出错误结论。
+    """
+    import io
+
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    for _ in range(pages):
+        writer.add_blank_page(width=200, height=200)
+    if encrypt:
+        writer.encrypt(encrypt)
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def make_pdf_file(pages: int = 1, *, name: str = "paper.pdf", encrypt: str | None = None) -> Any:
+    """包成 DRF 上传用的 SimpleUploadedFile。"""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(
+        name, make_pdf_bytes(pages, encrypt=encrypt), content_type="application/pdf"
+    )
+
+
+@pytest.fixture
+def pdf_bytes() -> Any:
+    return make_pdf_bytes(3)
+
+
+@pytest.fixture
+def upload_pdf_file() -> Any:
+    """可复用的上传文件工厂：`upload_pdf_file(pages=2, name="x.pdf")`。"""
+    return make_pdf_file
+
+
+@pytest.fixture(autouse=True)
+def _no_arxiv_rate_limit(settings: pytest.FixtureRequest) -> None:
+    """测试里不真的按 arXiv 频率下限等待；限流逻辑本身单测另行覆盖。"""
+    settings.MVP_LIMITS = {**settings.MVP_LIMITS, "ARXIV_MIN_INTERVAL_SECONDS": 0}

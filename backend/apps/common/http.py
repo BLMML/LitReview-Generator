@@ -342,6 +342,21 @@ def reject_unknown_query_params(request: Any, allowed: set[str]) -> None:
         )
 
 
+def reject_unknown_multipart_fields(request: Any, allowed: set[str]) -> None:
+    """multipart 上传体同样拒绝未列出的字段（docs/mvp/03 第 1.1 节）。
+
+    序列化器拦不住 multipart：`request.data` 里既有表单字段也有文件，
+    必须在这里显式比对，否则多余字段会被静默忽略。
+    """
+    unknown = sorted(set(request.data.keys()) - allowed)
+    if unknown:
+        raise api_error(
+            "VALIDATION_ERROR",
+            "请求包含未支持的字段",
+            {"fields": {name: ["未支持的字段"] for name in unknown}},
+        )
+
+
 def paginate(queryset: Any, request: Any) -> Response:
     """按 envelope 分页；排序由调用方（selectors）保证稳定。"""
     paginator = EnvelopePagination()

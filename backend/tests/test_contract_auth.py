@@ -9,9 +9,26 @@
 
 from __future__ import annotations
 
+import uuid
+
 import pytest
+from tests.conftest import make_pdf_file
 
 pytestmark = pytest.mark.django_db
+
+
+def _upload(client, project, *, key=None, file=None, title=None, **extra):
+    """带合法幂等键的上传；未显式传 key 时每次生成新键。"""
+    data = {"file": file if file is not None else make_pdf_file(2)}
+    if title is not None:
+        data["title"] = title
+    data.update(extra)
+    return client.post(
+        f"/api/v1/projects/{project.id}/papers/upload",
+        data,
+        format="multipart",
+        HTTP_IDEMPOTENCY_KEY=key or str(uuid.uuid4()),
+    )
 
 
 # ── 认证闭环 ──────────────────────────────────────────────────
@@ -256,6 +273,321 @@ def test_project_jobs_rejects_unknown_kind(client_a, project_a, api_v1):
 def test_get_unknown_job_is_404(client_a, api_v1):
     response = client_a.get(f"{api_v1}/jobs/11111111-1111-4111-8111-111111111111")
     assert response.status_code == 404
+
+
+# ── 文献上传 / 编辑 / 下载（M05）────────────────────────────────
+def test_paper_upload_requires_auth(api_client, project_a):
+    response = api_client.post(
+        f"/api/v1/projects/{project_a.id}/papers/upload",
+        {"file": make_pdf_file(1)},
+        format="multipart",
+        HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "AUTH_REQUIRED"
+
+
+def test_paper_upload_to_other_users_project_is_404(client_b, project_a):
+    """越权上传不泄露项目归属，且不产生任何文献。"""
+    from apps.literature.models import Paper
+
+    response = _upload(client_b, project_a)
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+    assert not Paper.objects.exists()
+
+
+def test_paper_upload_missing_file_is_400(client_a, project_a):
+    response = client_a.post(
+        f"/api/v1/projects/{project_a.id}/papers/upload",
+        {"title": "只有标题"},
+        format="multipart",
+        HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+    )
+    assert response.status_code == 400
+    detail = response.json()["error"]
+    assert detail["code"] == "VALIDATION_ERROR"
+    assert "file" in detail["details"]["fields"]
+
+
+def test_paper_upload_rejects_unknown_field(client_a, project_a):
+    """multipart 里的未知字段同样 400，不被静默忽略。"""
+    response = _upload(client_a, project_a, source="arxiv", included="false")
+    assert response.status_code == 400
+    detail = response.json()["error"]
+    assert detail["code"] == "VALIDATION_ERROR"
+    assert set(detail["details"]["fields"]) == {"source", "included"}
+
+
+def test_paper_upload_without_idempotency_key_is_400(client_a, project_a):
+    response = client_a.post(
+        f"/api/v1/projects/{project_a.id}/papers/upload",
+        {"file": make_pdf_file(1)},
+        format="multipart",
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_paper_upload_title_defaults_to_filename(client_a, project_a):
+    """未提供 title 时暂用文件名；authors/year 初始为空。"""
+    response = _upload(client_a, project_a, file=make_pdf_file(2, name="Attention is all you need.pdf"))
+    assert response.status_code == 201
+    data = response.json()["data"]
+    assert data["title"] == "Attention is all you need"
+    assert data["authors"] == [] and data["year"] is None
+    assert data["source"] == "upload" and data["source_id"] is None
+    assert data["included"] is True and data["version"] == 1
+    assert data["page_count"] == 2
+    assert data["original_filename"] == "Attention is all you need.pdf"
+    assert data["file_url"] == f"/api/v1/papers/{data['id']}/file"
+
+
+def test_paper_upload_title_too_long_is_400(client_a, project_a):
+    response = _upload(client_a, project_a, title="x" * 501)
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_paper_upload_rejects_uuid_key_that_is_not_a_uuid(client_a, project_a):
+    response = client_a.post(
+        f"/api/v1/projects/{project_a.id}/papers/upload",
+        {"file": make_pdf_file(1)},
+        format="multipart",
+        HTTP_IDEMPOTENCY_KEY="not-a-uuid",
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_paper_list_is_owner_scoped_and_paginated(client_a, client_b, project_a, project_b):
+    _upload(client_a, project_a, file=make_pdf_file(1, name="a1.pdf"))
+    _upload(client_a, project_a, file=make_pdf_file(2, name="a2.pdf"))
+    _upload(client_b, project_b, file=make_pdf_file(1, name="b1.pdf"))
+
+    response = client_a.get(f"/api/v1/projects/{project_a.id}/papers")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["meta"]["total"] == 2
+    assert [item["original_filename"] for item in body["data"]] == ["a2.pdf", "a1.pdf"]
+
+    # 另一个账号读别人的项目：整个项目对他不存在，必须是 404 而不是空列表
+    # （200 + 空列表会让「越权」和「本来就没文献」无法区分）
+    cross = client_b.get(f"/api/v1/projects/{project_a.id}/papers")
+    assert cross.status_code == 404
+    assert cross.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_paper_list_filters_by_included(client_a, project_a):
+    first = _upload(client_a, project_a, file=make_pdf_file(1, name="keep.pdf")).json()["data"]
+    second = _upload(client_a, project_a, file=make_pdf_file(2, name="drop.pdf")).json()["data"]
+    client_a.patch(
+        f"/api/v1/papers/{second['id']}", {"expected_version": 1, "included": False}, format="json"
+    )
+
+    included = client_a.get(f"/api/v1/projects/{project_a.id}/papers?included=true").json()
+    assert [item["id"] for item in included["data"]] == [first["id"]]
+
+    excluded = client_a.get(f"/api/v1/projects/{project_a.id}/papers?included=false").json()
+    assert [item["id"] for item in excluded["data"]] == [second["id"]]
+
+    bad = client_a.get(f"/api/v1/projects/{project_a.id}/papers?included=maybe")
+    assert bad.status_code == 400
+
+
+def test_paper_list_rejects_unknown_query_param(client_a, project_a):
+    response = client_a.get(f"/api/v1/projects/{project_a.id}/papers?sort=title")
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_paper_patch_updates_metadata_and_bumps_corpus_revision(client_a, project_a):
+    from apps.projects.models import Project
+
+    paper = _upload(client_a, project_a).json()["data"]
+    # 上传本身已经让语料快照前进一格（新增文献属于语料变化）
+    after_upload = Project.objects.get(pk=project_a.pk).corpus_revision
+
+    response = client_a.patch(
+        f"/api/v1/papers/{paper['id']}",
+        {
+            "expected_version": 1,
+            "title": "改名后的标题",
+            "authors": ["张三", "李四"],
+            "year": 2021,
+            "included": False,
+        },
+        format="json",
+    )
+    assert response.status_code == 200
+    data = response.json()["data"]
+    assert data["title"] == "改名后的标题"
+    assert data["authors"] == ["张三", "李四"]
+    assert data["year"] == 2021 and data["included"] is False
+    assert data["version"] == 2
+    # 元数据与纳入状态都属于语料快照
+    assert Project.objects.get(pk=project_a.pk).corpus_revision == after_upload + 1
+
+
+def test_paper_patch_with_identical_content_does_not_bump_version(client_a, project_a):
+    """内容相同的保存不涨版本，也不动语料版本。"""
+    from apps.projects.models import Project
+
+    paper = _upload(client_a, project_a, title="不变标题").json()["data"]
+    after_upload = Project.objects.get(pk=project_a.pk).corpus_revision
+
+    response = client_a.patch(
+        f"/api/v1/papers/{paper['id']}",
+        {"expected_version": 1, "title": "不变标题", "included": True},
+        format="json",
+    )
+    assert response.status_code == 200
+    assert response.json()["data"]["version"] == 1
+    assert Project.objects.get(pk=project_a.pk).corpus_revision == after_upload
+
+
+def test_paper_patch_with_stale_version_is_conflict(client_a, project_a):
+    paper = _upload(client_a, project_a).json()["data"]
+    client_a.patch(
+        f"/api/v1/papers/{paper['id']}", {"expected_version": 1, "title": "第一次"}, format="json"
+    )
+    response = client_a.patch(
+        f"/api/v1/papers/{paper['id']}", {"expected_version": 1, "title": "第二次"}, format="json"
+    )
+    assert response.status_code == 409
+    detail = response.json()["error"]
+    assert detail["code"] == "VERSION_CONFLICT"
+    assert detail["details"]["current_version"] == 2
+
+
+def test_paper_patch_requires_at_least_one_editable_field(client_a, project_a):
+    paper = _upload(client_a, project_a).json()["data"]
+    response = client_a.patch(
+        f"/api/v1/papers/{paper['id']}", {"expected_version": 1}, format="json"
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "VALIDATION_ERROR"
+
+
+def test_paper_patch_rejects_unknown_field_and_bad_year(client_a, project_a):
+    paper = _upload(client_a, project_a).json()["data"]
+
+    unknown = client_a.patch(
+        f"/api/v1/papers/{paper['id']}",
+        {"expected_version": 1, "title": "x", "citation_count": 3},
+        format="json",
+    )
+    assert unknown.status_code == 400
+    assert "citation_count" in unknown.json()["error"]["details"]["fields"]
+
+    # 年份低于 1000 违反契约与数据库检查约束
+    bad_year = client_a.patch(
+        f"/api/v1/papers/{paper['id']}", {"expected_version": 1, "year": 999}, format="json"
+    )
+    assert bad_year.status_code == 400
+
+
+def test_paper_patch_does_not_allow_replacing_the_file(client_a, project_a):
+    """PDF 不可原位替换：改哈希的请求必须被拒绝，不产生第二种响应形式。"""
+    paper = _upload(client_a, project_a).json()["data"]
+    response = client_a.patch(
+        f"/api/v1/papers/{paper['id']}",
+        {"expected_version": 1, "file_sha256": "0" * 64},
+        format="json",
+    )
+    assert response.status_code == 400
+    assert "file_sha256" in response.json()["error"]["details"]["fields"]
+
+
+def test_paper_detail_and_file_are_owner_scoped(client_b, client_a, project_a):
+    """跨用户读详情与下载原文一律 404，不泄露归属，也不暴露磁盘路径。"""
+    paper = _upload(client_a, project_a).json()["data"]
+
+    assert client_b.get(f"/api/v1/papers/{paper['id']}").status_code == 404
+    assert client_b.get(f"/api/v1/papers/{paper['id']}/file").status_code == 404
+
+    unknown = uuid.uuid4()
+    assert client_a.get(f"/api/v1/papers/{unknown}").status_code == 404
+    assert client_a.get(f"/api/v1/papers/{unknown}/file").status_code == 404
+
+
+def test_paper_file_download_returns_original_bytes(client_a, project_a):
+    """下载成功直接返回二进制，且字节与上传内容一致。"""
+    from tests.conftest import make_pdf_bytes
+
+    payload = make_pdf_bytes(2)
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    uploaded = SimpleUploadedFile("原文.pdf", payload, content_type="application/pdf")
+    paper = _upload(client_a, project_a, file=uploaded).json()["data"]
+
+    response = client_a.get(f"/api/v1/papers/{paper['id']}/file")
+    assert response.status_code == 200
+    assert response["Content-Type"] == "application/pdf"
+    assert b"".join(response.streaming_content) == payload
+    # 非 ASCII 文件名必须百分号编码，否则 WSGI 下会抛 UnicodeEncodeError
+    disposition = response["Content-Disposition"]
+    assert "filename*=UTF-8''" in disposition
+    assert "%E5%8E%9F%E6%96%87.pdf" in disposition
+    # 不得出现任何磁盘路径
+    assert "storage" not in disposition.lower()
+
+
+def test_paper_file_download_failure_is_json_not_binary(client_a, project_a):
+    """文件端点失败时仍返回标准 JSON 错误，而不是下载一段错误文本。"""
+    response = client_a.get(f"/api/v1/papers/{uuid.uuid4()}/file")
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "NOT_FOUND"
+
+
+def test_arxiv_import_requires_auth_and_valid_ids(api_client, client_a, project_a, monkeypatch):
+    monkeypatch.setattr("apps.jobs.services.dispatch", lambda job: None)
+
+    anonymous = api_client.post(
+        f"/api/v1/projects/{project_a.id}/imports/arxiv",
+        {"arxiv_ids": ["2401.00001"]},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+    )
+    assert anonymous.status_code == 401
+
+    unknown_field = client_a.post(
+        f"/api/v1/projects/{project_a.id}/imports/arxiv",
+        {"arxiv_ids": ["2401.00001"], "url": "https://example.com/x.pdf"},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=str(uuid.uuid4()),
+    )
+    assert unknown_field.status_code == 400
+
+    no_key = client_a.post(
+        f"/api/v1/projects/{project_a.id}/imports/arxiv",
+        {"arxiv_ids": ["2401.00001"]},
+        format="json",
+    )
+    assert no_key.status_code == 400
+
+
+def test_arxiv_import_is_idempotent_on_replay(client_a, project_a, monkeypatch):
+    """同键重放返回原受理响应，不新建 Job。"""
+    from apps.jobs.models import Job
+
+    monkeypatch.setattr("apps.jobs.services.dispatch", lambda job: None)
+    key = str(uuid.uuid4())
+    first = client_a.post(
+        f"/api/v1/projects/{project_a.id}/imports/arxiv",
+        {"arxiv_ids": ["2401.00001", "2401.00002"]},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=key,
+    )
+    second = client_a.post(
+        f"/api/v1/projects/{project_a.id}/imports/arxiv",
+        {"arxiv_ids": ["2401.00001", "2401.00002"]},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=key,
+    )
+    assert first.status_code == second.status_code == 202
+    assert first.json()["data"] == second.json()["data"]
+    assert Job.objects.count() == 1
 
 
 # ── 路由表完整性 ──────────────────────────────────────────────

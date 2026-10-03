@@ -74,6 +74,10 @@ ignore = [
 # docs/mvp/02 明确规定 source_id / provider_request_id / result 等字段可空，
 # 且空值语义与空字符串不同（部分唯一约束依赖 NULL）。此处按契约保留 null=True。
 "backend/apps/**/models.py" = ["DJ001"]
+# arxiv.py 解析的是外部响应。这里不用 defusedxml 新增依赖，而是先拒绝任何带
+# <!DOCTYPE 的响应（真实 Atom 响应不含 DTD），从源头挡掉 XXE 与实体膨胀；
+# 该行为由 backend/tests/test_arxiv_client.py 的 XXE / billion-laughs 用例守住。
+"backend/apps/literature/arxiv.py" = ["S314"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["apps", "config"]
