@@ -411,7 +411,14 @@ def test_export_download_draft_marked_and_private(client_a, client_b, validated)
     export = services.export_revision(claim_execution(data["job_id"]), data["resource_id"])
     response = client_a.get(f"/api/v1/exports/{export.id}/file")
     assert response.status_code == 200
-    assert "%" in response["Content-Disposition"] and "草稿" not in response["Content-Disposition"]
+    from urllib.parse import unquote
+
+    assert unquote(response["Content-Disposition"].split("filename*=UTF-8''", 1)[1]) == (
+        validated.review.project.title + "文献综述.docx"
+    )
+    assert export.file_asset.original_filename == validated.review.project.title + "文献综述.docx"
+    job = Job.objects.get(pk=data["job_id"])
+    assert job.frozen_input["revision_snapshot"]["project_title"] == validated.review.project.title
     content = b"".join(response.streaming_content)
     response.close()
     document = Document(BytesIO(content))
@@ -419,6 +426,19 @@ def test_export_download_draft_marked_and_private(client_a, client_b, validated)
     assert document.styles["Title"].element.xpath("./w:pPr/w:pBdr") == []
     assert client_b.get(f"/api/v1/exports/{export.id}/file").status_code == 404
     assert export.file_asset.purpose == FileAsset.PURPOSE_EXPORT_DOCX
+
+    # Historical files also adopt the current user-defined project name,
+    # without rewriting their document bytes or relying on an old asset name.
+    from apps.projects.models import Project
+
+    FileAsset.objects.filter(pk=export.file_asset_id).update(original_filename="legacy_综述_v1.docx")
+    Project.objects.filter(pk=validated.review.project_id).update(title='新项目/知识体系"研究"')
+    renamed = client_a.get(f"/api/v1/exports/{export.id}/file")
+    assert unquote(renamed["Content-Disposition"].split("filename*=UTF-8''", 1)[1]) == (
+        "新项目_知识体系_研究_文献综述.docx"
+    )
+    assert b"".join(renamed.streaming_content) == content
+    renamed.close()
 
 
 def test_export_replay_and_body_conflict(client_a, validated):

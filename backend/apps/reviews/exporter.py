@@ -13,7 +13,8 @@ from docx.oxml.ns import qn
 from docx.shared import Inches, Pt, RGBColor
 
 from apps.common.http import api_error
-from apps.common.storage import StagedFile, discard_staged, safe_display_filename, stage_file
+from apps.common.storage import StagedFile, discard_staged, stage_file
+from apps.reviews.filenames import export_docx_filename
 
 TEMPLATE_REVISION = "docx-template-v4-source-commentary"
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
@@ -146,11 +147,12 @@ def render_docx(
     stream = BytesIO()
     doc.save(stream)
     stream.seek(0)
-    name = safe_display_filename(revision_snapshot["title"], fallback="文献综述")[:170]
     staged = stage_file(
         stream,
         limit_bytes=MAX_DOCX_BYTES,
-        original_filename=f"{name}_v{revision_snapshot['revision_number']}_综述.docx",
+        original_filename=export_docx_filename(
+            revision_snapshot.get("project_title", revision_snapshot["title"])
+        ),
         media_type=DOCX_MEDIA_TYPE,
         suffix=".docx",
     )

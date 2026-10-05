@@ -5,6 +5,7 @@ import { onBeforeRouteLeave, useRoute, useRouter } from 'vue-router'
 import { api, allPages, download } from '../api/resources'
 import { useAction } from '../composables/action'
 import { useExportDelivery } from '../composables/exportDelivery'
+import { reviewExportFilename } from '../exportFilename'
 import { useEvidence } from '../composables/evidence'
 import { useWorkspace } from '../stores/workspace'
 import {
@@ -50,6 +51,7 @@ const id = String(route.params.id),
   picker = ref(false),
   loaded = ref(false)
 const exportDelivery = useExportDelivery()
+const wordFilename = computed(() => reviewExportFilename(store.project?.title))
 const evidence = useEvidence(() => store.run),
   dirty = computed(() => JSON.stringify(sections.value) !== original.value),
   disabled = computed(() => store.busy || action.pending.value)
@@ -164,7 +166,7 @@ async function task(
       store.accepted(r.data.job_id)
       if (r.data.resource_type === 'validation_report') reportId.value = r.data.resource_id
       if (r.data.resource_type === 'export')
-        exportDelivery.start(r.data.resource_id, exportFilename ?? '综述.docx')
+        exportDelivery.start(r.data.resource_id, exportFilename ?? wordFilename.value)
       await refresh()
       action.success.value = '任务已受理。'
     },
@@ -188,7 +190,7 @@ async function exportWord() {
   const revision = selected.value.id,
     validation = report.value.id,
     ack = acknowledged.value
-  const filename = `综述-v${selected.value.revision_number}.docx`
+  const filename = wordFilename.value
   const existing = exports.value.find(
     (e) =>
       e.revision_id === revision &&
@@ -256,11 +258,10 @@ async function cancel(id: string) {
 }
 async function retry(jobId: string) {
   const exported = exports.value.find((e) => e.job_id === jobId)
-  const version = revisions.value.find((v) => v.id === exported?.revision_id)?.revision_number
   await task(
     `retry:${jobId}`,
     (key) => api.retryJob(jobId, key),
-    exported ? `综述-v${version ?? ''}.docx` : undefined,
+    exported ? wordFilename.value : undefined,
   )
 }
 function beforeUnload(event: BeforeUnloadEvent) {
@@ -550,14 +551,7 @@ onBeforeUnmount(() => {
           <div class="actions">
             <button
               v-if="e.status === 'ready' && e.file_url"
-              @click="
-                action.perform(() =>
-                  download(
-                    e.file_url!,
-                    `综述-v${revisions.find((v) => v.id === e.revision_id)?.revision_number ?? ''}.docx`,
-                  ),
-                )
-              "
+              @click="action.perform(() => download(e.file_url!, wordFilename))"
             >
               下载 Word ↓</button
             ><button

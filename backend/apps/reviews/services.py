@@ -867,6 +867,7 @@ def create_export(actor: Any, review_id: Any, payload: Mapping[str, Any], key: A
             raise api_error("STRUCTURAL_VALIDATION_FAILED", "此手稿为旧结构，请重新生成以使用固定研究框架")
         snapshot = {
             "title": review.title,
+            "project_title": project.title,
             "revision_id": str(revision.id),
             "revision_number": revision.revision_number,
             "run_id": str(revision.run_id),

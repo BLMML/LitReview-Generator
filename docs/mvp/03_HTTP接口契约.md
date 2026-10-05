@@ -44,7 +44,7 @@
 }
 ```
 
-PDF / Word 下载成功直接返回二进制，不包 JSON。读取失败仍返回错误 JSON。PDF 返回 `application/pdf`、inline；Word 返回 DOCX MIME、attachment；文件名按 UTF-8 编码 Content-Disposition，不泄漏存储路径。PDF.js 必须允许整文件 200 加载；实现 Range 时遵守 206/416 语义。
+PDF / Word 下载成功直接返回二进制，不包 JSON。读取失败仍返回错误 JSON。PDF 返回 `application/pdf`、inline；Word 返回 DOCX MIME、attachment；文件名按 UTF-8 编码 Content-Disposition，不泄漏存储路径。Word 下载统一使用当前用户定义的项目名称加“文献综述.docx”，不附加正文版本号；历史导出再次下载也遵循此规则，非法文件名字符替换为下划线。新导出受理时同时冻结项目名称用于资产显示名，正文及报告绑定保持原契约。PDF.js 必须允许整文件 200 加载；实现 Range 时遵守 206/416 语义。
 
 ### 1.3 幂等与异步
 

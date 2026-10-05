@@ -31,6 +31,7 @@ from apps.common.http import (
 from apps.common.idempotency import parse_idempotency_key
 from apps.common.storage import open_asset
 from apps.projects.selectors import get_owned_project
+from apps.reviews.filenames import export_docx_filename
 from apps.reviews.models import Export, Review, ReviewRevision, ValidationReport
 from apps.reviews.services import (
     create_export,
@@ -361,7 +362,7 @@ def export_file(request: Any, export_id: Any) -> Response | FileResponse:
     """GET /exports/{export_id}/file：未 ready 为 409 RESULT_NOT_READY。"""
     actor = require_actor(request)
     export = (
-        Export.objects.select_related("revision", "revision__review", "file_asset")
+        Export.objects.select_related("revision", "revision__review__project", "file_asset")
         .filter(
             pk=export_id,
             revision__review__project__owner=actor.user,
@@ -381,7 +382,7 @@ def export_file(request: Any, export_id: Any) -> Response | FileResponse:
     response = FileResponse(handle, content_type=asset.media_type or DOCX_MEDIA_TYPE)
     response["Content-Length"] = str(asset.size_bytes)
     # attachment：Word 草稿按下载处理；文件名 UTF-8 编码，不泄漏存储路径
-    filename = quote(asset.original_filename, safe="")
+    filename = quote(export_docx_filename(export.revision.review.project.title), safe="")
     response["Content-Disposition"] = f"attachment; filename*=UTF-8''{filename}"
     return response
 
