@@ -5,7 +5,7 @@
 - 结构校验是保存和生成提交的**共同门槛**。
 
 硬性限制：
-- 新稿固定六个内容槽，兼容历史五节顺序与 section_key；
+- 新稿固定八个内容槽，兼容历史五节与六槽顺序；述评类型及争议编号随正文冻结；
 - 每节至少一个 block；全稿 ≤100 block；每块 1—600 字符、≤20 引用；
 - block_id 全文唯一；kind ∈ claim/transition；
 - claim 至少一个当前 Run 证据；禁止 HTML、非法引用；
@@ -23,6 +23,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any
 
 from apps.reviews.models import BLOCK_KIND_CLAIM, BLOCK_KINDS, SECTION_KEYS
+from apps.reviews.structure import ANALYSIS_ROLES, LEGACY_SOURCE_KEYS
 from apps.reviews.structure import SECTION_KEYS as SOURCE_SECTION_KEYS
 
 NOT_IMPLEMENTED_MESSAGE = "reviews.schemas 尚未实现（MVP 骨架阶段，见 docs/mvp/05 阶段 D）"
@@ -53,6 +54,7 @@ def validate_sections(
     expected_keys: Sequence[str] | None = None,
     max_blocks_per_section: int | None = None,
     allow_source_numbers: bool = False,
+    commentary_layout: bool = False,
 ) -> list[dict[str, Any]]:
     """校验并规范化正文；返回可直接入库的 `sections`。
 
@@ -64,11 +66,22 @@ def validate_sections(
     if isinstance(sections, (str, bytes)) or not isinstance(sections, Sequence):
         raise SectionsValidationError("sections 必须是数组")
 
-    source_layout = len(sections) == len(SOURCE_SECTION_KEYS)
+    source_layout = len(sections) in (len(SOURCE_SECTION_KEYS), len(LEGACY_SOURCE_KEYS))
+    commentary_layout = (
+        commentary_layout
+        or len(sections) == len(SOURCE_SECTION_KEYS)
+        or (expected_keys is not None and "limitations" in expected_keys)
+    )
     keys = (
         list(expected_keys)
         if expected_keys is not None
-        else list(SOURCE_SECTION_KEYS if source_layout else SECTION_KEYS)
+        else list(
+            SOURCE_SECTION_KEYS
+            if len(sections) == len(SOURCE_SECTION_KEYS)
+            else LEGACY_SOURCE_KEYS
+            if source_layout
+            else SECTION_KEYS
+        )
     )
     if len(sections) != len(keys):
         raise SectionsValidationError(f"必须提供 {len(keys)} 个章节，实际 {len(sections)} 个")
@@ -119,6 +132,7 @@ def validate_sections(
                 allowed=allowed_evidence,
                 seen=seen_block_ids,
                 reject_numbers=not (source_layout or allow_source_numbers),
+                analysis_roles=ANALYSIS_ROLES.get(key) if commentary_layout else None,
             )
             for index, item in enumerate(blocks)
         ]
@@ -131,10 +145,14 @@ def validate_sections(
     return normalized
 
 
-def _block(raw: Any, *, name: str, allowed: set[str], seen: set[str], reject_numbers=True) -> dict[str, Any]:
+def _block(
+    raw: Any, *, name: str, allowed: set[str], seen: set[str], reject_numbers=True, analysis_roles=None
+) -> dict[str, Any]:
     if not isinstance(raw, Mapping):
         raise SectionsValidationError(f"{name} 必须是对象")
-    unknown = sorted(set(raw) - {"block_id", "kind", "text", "evidence_ids"})
+    unknown = sorted(
+        set(raw) - {"block_id", "kind", "text", "evidence_ids", "analysis_role", "controversy_number"}
+    )
     if unknown:
         raise SectionsValidationError(f"{name} 含未知字段：{unknown}")
     missing = [key for key in ("block_id", "kind", "text", "evidence_ids") if key not in raw]
@@ -189,7 +207,22 @@ def _block(raw: Any, *, name: str, allowed: set[str], seen: set[str], reject_num
         # claim 是事实性论断，没有证据就不是可核验的正文
         raise SectionsValidationError(f"{name} 是 claim，必须至少引用一条本 Run 证据")
 
-    return {"block_id": block_id, "kind": kind, "text": text, "evidence_ids": evidence_ids}
+    result = {"block_id": block_id, "kind": kind, "text": text, "evidence_ids": evidence_ids}
+    if analysis_roles is not None and kind == BLOCK_KIND_CLAIM:
+        role = raw.get("analysis_role")
+        if role not in analysis_roles:
+            raise SectionsValidationError(f"{name}.analysis_role 不符合述评子模块")
+        result["analysis_role"] = role
+        if role in ("viewpoint_comparison", "root_cause"):
+            number = raw.get("controversy_number")
+            if type(number) is not int or not 1 <= number <= 20:
+                raise SectionsValidationError(f"{name}.controversy_number 必须是 1—20 的争议编号")
+            result["controversy_number"] = number
+        elif "controversy_number" in raw:
+            raise SectionsValidationError(f"{name} 仅争议对比与成因分析可填写争议编号")
+    elif "analysis_role" in raw or "controversy_number" in raw:
+        raise SectionsValidationError(f"{name} 原文或缺失说明不能标为自主述评")
+    return result
 
 
 def _allowed_evidence(run_scope: Any) -> set[str]:
@@ -220,6 +253,7 @@ def normalize_sections(sections: Sequence[Any]) -> str:
                     "kind": block.get("kind"),
                     "text": (block.get("text") or "").strip(),
                     "evidence_ids": [str(value) for value in (block.get("evidence_ids") or [])],
+                    **{key: block[key] for key in ("analysis_role", "controversy_number") if key in block},
                 }
                 for block in (section.get("blocks") or [])
             ],

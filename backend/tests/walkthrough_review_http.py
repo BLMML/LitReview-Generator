@@ -1,4 +1,4 @@
-"""M10 端到端走查：创建 Review → 生成五节正文 → 编辑保存新版本。
+"""M10 端到端走查：创建 Review → 生成八槽正文 → 编辑保存新版本。
 
 这是**手工运行的脚本**，不是 pytest 用例（文件名不以 test_ 开头）。
 它对真实运行的服务发真请求，验证 `docs/mvp/05` 第 6 节要求的 HTTP 阶段走查。
@@ -14,7 +14,7 @@
 
 关于正文条数：`LLM_MODE=mock` 时 `generate_sections` 夹具返回的 block 引用
 占位 UUID，不在本节证据白名单内，因此**生成会以 MODEL_OUTPUT_INVALID 诚实失败**。
-本脚本接受两种终态并分别断言：成功则校验五节结构与 DTO；失败则要求
+本脚本接受两种终态并分别断言：成功则校验八槽结构与 DTO；失败则要求
 `latest_revision` 保持为 null，绝不展示空白“成功综述”。
 真实模型下的成功路径由 `tests/test_m10_reviews.py` 用替身完整覆盖。
 """
@@ -52,17 +52,20 @@ QUESTION = "Does attention improve sequence modelling accuracy on small-sample b
 
 SECTION_KEYS = (
     "background",
-    "directions",
-    "representative_work",
-    "disagreements",
-    "trends",
+    "approach",
+    "significance",
+    "theoretical_basis",
+    "research_status",
+    "achievements",
+    "limitations",
+    "innovation",
 )
 
 # 提示用户保存为 backend/_advance_m10.py 的辅助脚本。
 # 它新建一个 ready 的 Run：用**正式入口** claim_execution 领取执行资格
 # （自造 ExecutionContext 会被租约校验按状态与有效期拒掉），
 # 再真实解析每篇文献、写入单篇分析与主题。
-_ADVANCE_HELPER = '''\
+_ADVANCE_HELPER = """\
 import json, uuid
 
 from apps.analysis.models import (
@@ -116,7 +119,7 @@ Topic.objects.create(
 AnalysisRun.objects.filter(pk=run.pk).update(status=RUN_READY, error=None)
 Job.objects.filter(pk=job.id).update(status="succeeded", lease_expires_at=None)
 print("RUN_ID", run.id)
-'''
+"""
 
 
 def make_text_pdf(pages: list[str]) -> bytes:
@@ -326,13 +329,16 @@ def main() -> int:
         print()
         print("  把下面内容存成 backend/_advance_m10.py，然后执行：")
         print("    cd backend")
-        print("    ..\\.venv\\Scripts\\python.exe manage.py shell -c "
-              '"exec(open(\'_advance_m10.py\', encoding=\'utf-8\').read())"')
+        print(
+            "    ..\\.venv\\Scripts\\python.exe manage.py shell -c "
+            "\"exec(open('_advance_m10.py', encoding='utf-8').read())\""
+        )
         print()
         print(_ADVANCE_HELPER.format(project_id=project_id))
         print()
-        print("  脚本会打印新的 RUN_ID，然后：python backend/tests/"
-              "walkthrough_review_http.py --run <新 RUN_ID>")
+        print(
+            "  脚本会打印新的 RUN_ID，然后：python backend/tests/walkthrough_review_http.py --run <新 RUN_ID>"
+        )
         print("-" * 68)
         print("本次到此为止：文献与 Run 已受理，只差 ready 前置。")
         print(f"RUN_ID={run_id}")
@@ -386,7 +392,7 @@ def main() -> int:
         check("提交了 revision 1", (revision or {}).get("revision_number") == 1, str(revision)[:100])
         sections = (revision or {}).get("sections") or []
         check(
-            "五节顺序固定",
+            "八槽顺序固定",
             [item.get("section_key") for item in sections] == list(SECTION_KEYS),
             str([item.get("section_key") for item in sections]),
         )
@@ -396,10 +402,7 @@ def main() -> int:
         check(
             "claim 都带证据",
             all(
-                b.get("evidence_ids")
-                for item in sections
-                for b in item["blocks"]
-                if b.get("kind") == "claim"
+                b.get("evidence_ids") for item in sections for b in item["blocks"] if b.get("kind") == "claim"
             ),
         )
         check("source = generated", (revision or {}).get("source") == "generated")

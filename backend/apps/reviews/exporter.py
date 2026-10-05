@@ -15,7 +15,7 @@ from docx.shared import Inches, Pt, RGBColor
 from apps.common.http import api_error
 from apps.common.storage import StagedFile, discard_staged, safe_display_filename, stage_file
 
-TEMPLATE_REVISION = "docx-template-v3-source-only"
+TEMPLATE_REVISION = "docx-template-v4-source-commentary"
 DOCX_MEDIA_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
 MAX_DOCX_BYTES = 32 * 1024 * 1024
 SUPPORT_LABELS = {
@@ -94,20 +94,32 @@ def render_docx(
     bibliography: Sequence[Any],
     evidence: Sequence[Any],
 ) -> StagedFile:
-    from apps.reviews.structure import MISSING_CONTENT, is_source_structure, section_heading
+    from apps.reviews.structure import (
+        MISSING_CONTENT,
+        commentary_notices,
+        is_commentary_structure,
+        section_heading,
+    )
 
-    if not is_source_structure(revision_snapshot["sections"]):
+    if not is_commentary_structure(revision_snapshot["sections"]):
         raise api_error("STRUCTURAL_VALIDATION_FAILED", "Word 导出必须使用固定研究框架，请重新生成综述")
     doc = Document()
     _style_document(doc)
     doc.add_paragraph(revision_snapshot["title"], "Title")
     citations = revision_snapshot.get("source_citations", {})
+    commentary = is_commentary_structure(revision_snapshot["sections"])
+    notices = commentary_notices(revision_snapshot["sections"], validation_report.get("blocks"))
     for section in revision_snapshot["sections"]:
         key = section["section_key"]
         if key == "theoretical_basis":
             doc.add_heading("4 文献综述", level=1)
-        heading, level = section_heading(key)
+        if commentary and key == "achievements":
+            doc.add_heading("5 文献述评", level=1)
+        heading, level = section_heading(key, legacy=not commentary)
         doc.add_heading(heading, level=level)
+        if commentary and key == "limitations":
+            for notice in notices:
+                doc.add_paragraph(notice)
         for block in section["blocks"]:
             paragraph = doc.add_paragraph(block["text"])
             sources = citations.get(block["block_id"])

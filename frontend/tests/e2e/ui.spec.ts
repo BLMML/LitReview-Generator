@@ -51,17 +51,36 @@ const now = '2026-10-02T00:00:00Z',
 const sections: Section[] = (
   [
     'background',
-    'significance',
     'approach',
+    'significance',
     'theoretical_basis',
     'research_status',
     'achievements',
+    'limitations',
+    'innovation',
   ] as const
 ).map((key, i) => ({
   section_key: key,
-  title: ['研究背景', '研究意义', '研究思路', '理论基础', '国内外研究现状', '已取得研究成果'][i],
+  title: [
+    '研究背景',
+    '研究思路',
+    '研究意义',
+    '理论基础',
+    '国内外研究现状',
+    '已取得的成果',
+    '文献的不足之处',
+    '本文创新点',
+  ][i],
   blocks: [
     {
+      ...(i >= 5
+        ? {
+            analysis_role: (['achievement', 'viewpoint_comparison', 'research_gap'] as const)[
+              i - 5
+            ],
+            ...(i === 6 ? { controversy_number: 1 } : {}),
+          }
+        : {}),
       block_id: uid(10 + i),
       kind: 'claim',
       text: '这是测试夹具的正文，需要回看证据。',
@@ -576,21 +595,32 @@ test('the fixed research framework locks titles and permits one source per block
 }) => {
   await fixture(page)
   await page.goto(`/reviews/${reviewId}`)
-  await expect(page.locator('.heading-input')).toHaveCount(6)
+  await expect(page.locator('.heading-input')).toHaveCount(8)
   const titles = [
     '研究背景',
-    '研究意义',
     '研究思路',
+    '研究意义',
     '理论基础',
     '国内外研究现状',
-    '已取得研究成果',
+    '已取得的成果',
+    '文献的不足之处',
+    '本文创新点',
   ]
   for (let i = 0; i < titles.length; i++) {
     await expect(page.locator('.heading-input').nth(i)).toHaveValue(titles[i])
     await expect(page.locator('.heading-input').nth(i)).toBeDisabled()
   }
   await expect(page.getByRole('heading', { name: '04 文献综述', exact: true })).toBeVisible()
-  await expect(page.locator('.section-number')).toHaveText(['01', '02', '03', '04.1', '04.2', '05'])
+  await expect(page.locator('.section-number')).toHaveText([
+    '01',
+    '02',
+    '03',
+    '04.1',
+    '04.2',
+    '05.1',
+    '05.2',
+    '05.3',
+  ])
   await expect(page.getByRole('button', { name: '+ 选择原文证据' }).first()).toBeDisabled()
 })
 
@@ -892,4 +922,23 @@ test('an uncertain export response is resolved with its original key even when h
   const submits = writes.filter((w) => w.path.endsWith('/exports'))
   expect(submits).toHaveLength(2)
   expect(submits[1].key).toBe(submits[0].key)
+})
+
+test('commentary roles and controversy numbers survive a version save, with an honest draft notice', async ({
+  page,
+}) => {
+  const { writes } = await fixture(page)
+  await page.goto(`/reviews/${reviewId}`)
+  await expect(page.getByRole('heading', { name: '05 文献述评', exact: true })).toBeVisible()
+  await expect(page.getByText('争议证据不足：', { exact: false }).first()).toBeVisible()
+  const limitations = page.locator('.section-sheet').nth(6)
+  await expect(limitations.getByRole('button', { name: '+ 选择原文证据' })).toBeEnabled()
+  await limitations.getByLabel('分析内容', { exact: true }).selectOption('root_cause')
+  await limitations.getByLabel('争议编号', { exact: true }).fill('2')
+  await page.getByRole('button', { name: '保存为新版本 →' }).click()
+  await expect.poll(() => writes.length).toBe(1)
+  expect((writes[0].body as { sections: Section[] }).sections[6].blocks[0]).toMatchObject({
+    analysis_role: 'root_cause',
+    controversy_number: 2,
+  })
 })

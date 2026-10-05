@@ -7,7 +7,13 @@ import { useAction } from '../composables/action'
 import { useExportDelivery } from '../composables/exportDelivery'
 import { useEvidence } from '../composables/evidence'
 import { useWorkspace } from '../stores/workspace'
-import { draftError, exportAllowed, exportWarnings } from '../reviewRules'
+import {
+  commentaryNotices,
+  isCommentarySection,
+  draftError,
+  exportAllowed,
+  exportWarnings,
+} from '../reviewRules'
 import { ApiError } from '../api/client'
 import { draftGuard } from '../composables/draftGuard'
 import {
@@ -60,12 +66,21 @@ const validationJob = computed(() => (report.value ? jobMap.value[report.value.j
 const sourceLayout = computed(
   () => !!selected.value?.sections.some((s) => s.section_key === 'significance'),
 )
+const commentaryMessages = computed(() =>
+  commentaryNotices(
+    sections.value,
+    !dirty.value && report.value?.revision_id === selected.value?.id
+      ? report.value?.blocks
+      : undefined,
+  ),
+)
 const warnings = computed(() =>
     exportWarnings(selected.value, review.value, store.run, report.value),
   ),
   canExport = computed(
     () =>
-      sourceLayout.value &&
+      selected.value?.sections.map((s) => s.section_key).join(',') ===
+        'background,approach,significance,theoretical_basis,research_status,achievements,limitations,innovation' &&
       exportAllowed(selected.value, report.value, validationJob.value, dirty.value),
   )
 async function refresh() {
@@ -198,10 +213,21 @@ async function exportWord() {
 function addEvidence(value: Evidence) {
   if (disabled.value || !activeBlock.value) return
   const copy = clone(sections.value),
-    block = copy.flatMap((s) => s.blocks).find((b) => b.block_id === activeBlock.value)
+    section = copy.find((s) => s.blocks.some((b) => b.block_id === activeBlock.value)),
+    block = section?.blocks.find((b) => b.block_id === activeBlock.value)
+  const analysis = section && isCommentarySection(copy, section.section_key)
+  if (
+    analysis &&
+    !copy
+      .filter((s) => !isCommentarySection(copy, s.section_key))
+      .some((s) => s.blocks.some((b) => b.evidence_ids.includes(value.id)))
+  ) {
+    action.error.value = '述评须选择前文原文模块已经引用的证据。'
+    return
+  }
   if (
     !block ||
-    block.evidence_ids.length >= (sourceLayout.value ? 1 : 20) ||
+    block.evidence_ids.length >= (sourceLayout.value && !analysis ? 1 : 20) ||
     block.evidence_ids.includes(value.id)
   )
     return
@@ -299,7 +325,8 @@ onBeforeUnmount(() => {
           <p class="eyebrow">THE WORKING MANUSCRIPT / 04</p>
           <h1>{{ review.title }}</h1>
           <p class="muted">
-            固定研究框架 · 目标 {{ review.target_chars }} 字 · 正文采用原文，出处定位到页、段、行。
+            固定研究框架 · 目标 {{ review.target_chars }} 字 ·
+            原文摘录与自主述评，依据定位到页、段、行。
           </p>
         </div>
         <span class="pencil-note">边写，边核对。</span>
@@ -370,11 +397,22 @@ onBeforeUnmount(() => {
         <p v-if="selected.is_stale" class="notice warning">
           此正文基于历史分析版本，保存修改不会自动消除过时状态。
         </p>
-        <p v-if="!sourceLayout" class="notice warning">
+        <p
+          v-if="!selected.sections.some((s) => s.section_key === 'limitations')"
+          class="notice warning"
+        >
           此手稿使用旧章节结构。请返回项目重新生成综述，再按固定研究框架导出 Word。
         </p>
         <p v-else class="footnote">
-          正文须保留所引证据的完整原句或原段，每块对应一条证据。缺失模块只填写“提供的素材中没有该内容。”，不添加其他说明。
+          研究背景、研究思路、研究意义与文献综述保留完整原句或原段，每块对应一条证据。文献述评基于前文证据自主分析。缺失模块填写“提供的素材中没有该内容。”；争议不足时允许导出带说明的述评草稿。
+        </p>
+        <p
+          v-for="message in commentaryMessages"
+          :key="message"
+          class="notice warning"
+          role="status"
+        >
+          {{ message }}
         </p>
         <div class="review-layout">
           <div class="manuscript">

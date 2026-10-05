@@ -37,7 +37,9 @@
 7. 引用缺失或引用内容读不到时，按实际情况给出 `structure_ok=false` 与相应 `support`，并在 `issues` 说明缺什么；**不要伪造 supported**，也不要因无法判断而省略该 block。
 8. 不要评价写作风格、篇幅或语言优美程度；本任务只判断事实支持与结构合规。
 9. 输入标记 `source_policy=pdf-source-only-v1` 时，同时检查 `section_key` / `section_title` 指定的模块归属：研究背景、研究意义、研究思路、理论基础、国内外研究现状、已取得研究成果。原文真实不等于模块归属正确；不得把未来计划或建议归为已取得成果，或把一般背景归为理论基础。对照所给完整证据检查摘录是否遗漏必要的上下文、限定或否定而改变原意；不适合该模块、曲解或添加评价的内容须记入 issues，按情况给出 unsupported / uncertain，不能仅因逐字匹配就判断 supported。
-10. 固定缺失说明“提供的素材中没有该内容。”是缺失占位，不是研究结论。不能根据某一批没有附带证据就认定全部素材都没有该内容；无法判断时标记 uncertain 并提示核对素材覆盖范围。
+10. 输入 source_policy=pdf-source-with-commentary-v2 且 content_mode=source_excerpt 时，严格执行逐字原文、模块归属与无主观扩展规则；前五槽顺序是研究背景、研究思路、研究意义、理论基础、国内外研究现状。
+11. content_mode=autonomous_commentary 时允许基于前文 source_passages 的自主分析，不能因为非逐字摘录就拒绝。依据核对必须使用前文 source_passages；完整 evidence 仅供语境核对，不可用其中未进入前文的事实扩展述评。根据 analysis_role 判断：achievement 必须为已完成成果；viewpoint_comparison 必须识别有依据的真实争议，并对比各观点合理性及局限；root_cause 必须区分已证实原因与可能的样本、设计、理论假设差异；research_gap / future_direction / innovation 必须为有依据的空白与研究建议，不可编造实证事实或声称已经创新。参考 commentary_context 判断争议编号对应内容是否相同、至少两个争议是否相互不同；编号不同不等于真实争议不同。任何缺少观点、局限、成因或证据的分析都给出具体 issues；不确定用 uncertain，不默认 supported。
+12. 固定缺失说明“提供的素材中没有该内容。”是缺失占位，不是研究结论。不能根据某一批没有附带证据就认定全部素材都没有该内容；无法判断时标记 uncertain 并提示核对素材覆盖范围。
 
 ## 4. 输出结构（严格 JSON）
 

@@ -140,21 +140,9 @@ def _patch_models(monkeypatch, *, section_override=None):
         if section_override is not None:
             payload = section_override(key, allowed)
         else:
-            payload = {
-                "section_key": key,
-                "title": f"{key} title",
-                "blocks": [
-                    {
-                        "kind": "claim",
-                        "text": __import__("apps.parsing.models", fromlist=["EvidenceChunk"])
-                        .EvidenceChunk.objects.get(pk=allowed[i])
-                        .text[:250]
-                        .strip(),
-                        "evidence_ids": [allowed[i]],
-                    }
-                    for i in range(2)
-                ],
-            }
+            from tests.test_m10_reviews import _section_payload
+
+            payload = _section_payload(key, allowed)
         return SimpleNamespace(payload=payload, call_id=f"mock:{key}")
 
     monkeypatch.setattr(review_services, "call_structured", review_call)
@@ -208,7 +196,7 @@ def test_wrong_section_key_is_rejected_before_commit(client_a, run_ready, monkey
     with pytest.raises(ApiError) as error:
         review_services.generate_review(context, accepted["resource_id"])
     assert error.value.code == "MODEL_OUTPUT_INVALID"
-    assert error.value.details["section_key"] == "significance"
+    assert error.value.details["section_key"] == "approach"
     assert not ReviewRevision.objects.exists()
 
 
@@ -308,6 +296,15 @@ def test_claim_requires_evidence_from_current_run(client_a, run_ready):
                         "kind": "claim",
                         "text": "claim",
                         "evidence_ids": block_evidence,
+                        **(
+                            {"analysis_role": "achievement"}
+                            if key == "achievements"
+                            else {"analysis_role": "viewpoint_comparison", "controversy_number": 1}
+                            if key == "limitations"
+                            else {"analysis_role": "research_gap"}
+                            if key == "innovation"
+                            else {}
+                        ),
                     }
                 ],
             }

@@ -13,7 +13,7 @@ from typing import Any
 
 from apps.llm.schemas import ModelTaskRequest
 
-DEFAULT_MOCK_VERSION = "request-bound-v2-source-only"
+DEFAULT_MOCK_VERSION = "request-bound-v4-source-selection"
 SECTION_TITLES = {
     "background": "研究背景",
     "directions": "主要研究方向",
@@ -112,7 +112,7 @@ def default_payload(request: ModelTaskRequest) -> dict:
             "achievements": r"已取得研究成果|研究结果|实验结果|results?",
         }
         block = {"kind": "transition", "text": MISSING_CONTENT, "evidence_ids": []}
-        if key in patterns:
+        if key in patterns and key not in ("achievements", "limitations", "innovation"):
             for chunk in _items(request.payload.get("evidence_package")):
                 if str(chunk.get("evidence_id")) not in evidence:
                     continue
@@ -129,7 +129,16 @@ def default_payload(request: ModelTaskRequest) -> dict:
                         re.finditer(r"[。！？](?:[”’\"\')]?)|[.!?](?:[”’\"\')]?)(?:\s|$)", remaining[:450])
                     )
                     quote = remaining[: stops[-1].end()].strip() if stops else ""
-                    if quote:
+                    choices = chunk.get("quotable_passages", [])
+                    if choices and isinstance(choices[0], Mapping):
+                        compact = "".join(remaining.split())
+                        selected = next(
+                            (item for item in choices if "".join(item["text"].split()) in compact), None
+                        )
+                        if selected:
+                            block = {"kind": "claim", "source_passage_id": selected["source_passage_id"]}
+                            break
+                    if quote and not choices:
                         block = {"kind": "claim", "text": quote, "evidence_ids": [str(chunk["evidence_id"])]}
                         break
         return {

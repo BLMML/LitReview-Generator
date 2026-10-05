@@ -124,14 +124,18 @@ def test_missing_modules_export_exact_notice_and_fixed_hierarchy(client_a, gener
         word = Document(stream)
     assert [(p.style.name, p.text) for p in word.paragraphs if p.style.name.startswith("Heading")] == [
         ("Heading 1", "1 研究背景"),
-        ("Heading 1", "2 研究意义"),
-        ("Heading 1", "3 研究思路"),
+        ("Heading 1", "2 研究思路"),
+        ("Heading 1", "3 研究意义"),
         ("Heading 1", "4 文献综述"),
         ("Heading 2", "4.1 理论基础"),
         ("Heading 2", "4.2 国内外研究现状"),
-        ("Heading 1", "5 已取得研究成果"),
+        ("Heading 1", "5 文献述评"),
+        ("Heading 2", "5.1 已取得的成果"),
+        ("Heading 2", "5.2 文献的不足之处"),
+        ("Heading 2", "5.3 本文创新点"),
     ]
-    assert [p.text for p in word.paragraphs].count(MISSING_CONTENT) == 6
+    assert [p.text for p in word.paragraphs].count(MISSING_CONTENT) == 8
+    assert any("争议证据不足" in p.text for p in word.paragraphs)
     assert not any("模拟草稿" in p.text or "参考文献" in p.text for p in word.paragraphs)
 
 
@@ -166,7 +170,15 @@ def test_semantic_validation_receives_fixed_module_context(client_a, generated, 
     for request in calls:
         for block in request.payload["blocks_with_evidence"]:
             assert (block["section_key"], block["section_title"]) == expected[block["block_id"]]
-            assert block["source_policy"] == "pdf-source-only-v1"
+            assert block["source_policy"] == "pdf-source-with-commentary-v2"
+            assert block["content_mode"] == (
+                "autonomous_commentary"
+                if block["section_key"] in ("achievements", "limitations", "innovation")
+                else "source_excerpt"
+            )
+            if block["content_mode"] == "autonomous_commentary":
+                assert block["commentary_context"]
+                assert all(e["source_passages"] for e in block["evidence"])
 
 
 def test_old_manuscript_requires_regeneration_before_new_export(client_a, generated, monkeypatch):

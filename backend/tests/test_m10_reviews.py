@@ -138,6 +138,38 @@ def _section_payload(section_key: str, evidence_ids: list[str], *, blocks: int =
     （重复引用既无意义，也让"哪条证据支持哪句"无法追溯）。
     """
     assert len(evidence_ids) >= blocks, "证据包必须够每块分到一条不同证据"
+    from apps.reviews.structure import ANALYSIS_ROLES
+
+    roles = ANALYSIS_ROLES.get(section_key)
+    if roles:
+        entries = (
+            [("achievement", None)]
+            if section_key == "achievements"
+            else (
+                [
+                    ("viewpoint_comparison", 1),
+                    ("root_cause", 1),
+                    ("viewpoint_comparison", 2),
+                    ("root_cause", 2),
+                ]
+                if section_key == "limitations"
+                else [("research_gap", None), ("future_direction", None), ("innovation", None)]
+            )
+        )
+        return {
+            "section_key": section_key,
+            "title": f"{section_key} 标题",
+            "blocks": [
+                {
+                    "kind": "claim",
+                    "text": "Evidence-based commentary fixture for validation tests.",
+                    "evidence_ids": evidence_ids[:2],
+                    "analysis_role": role,
+                    **({"controversy_number": number} if number is not None else {}),
+                }
+                for role, number in entries
+            ],
+        }
     return {
         "section_key": section_key,
         "title": f"{section_key} 标题",
@@ -405,6 +437,15 @@ def _sections(scope, *, keys=None, blocks_per_section=1, evidence: str | None = 
                     "kind": "claim",
                     "text": f"{key} 的论断 {index}",
                     "evidence_ids": [eid],
+                    **(
+                        {"analysis_role": "achievement"}
+                        if key == "achievements"
+                        else {"analysis_role": "viewpoint_comparison", "controversy_number": index + 1}
+                        if key == "limitations"
+                        else {"analysis_role": "research_gap"}
+                        if key == "innovation"
+                        else {}
+                    ),
                 }
                 for index in range(blocks_per_section)
             ],

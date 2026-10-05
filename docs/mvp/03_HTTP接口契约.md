@@ -1,5 +1,7 @@
 # HTTP 接口契约
 
+2026-10-05 更新：新稿及新 Word 导出使用八个内容槽，固定研究背景→研究思路→研究意义→文献综述→文献述评；前四模块保留原文，述评基于前文自主分析，争议不足允许带说明导出。历史规范以此更新为准，详见 [固定框架与自主述评](Word固定框架与自主述评_2026-10-05.md)。
+
 版本：1.0｜路径：`/api/v1`｜日期：2026-09-19。
 
 配套机器可读契约：[contracts/openapi.json](contracts/openapi.json)。接口字段以本文件和 OpenAPI 同步维护，模型输出字段见 04，数据库字段见 02。下述请求均是设计示例，并非已运行服务。
@@ -161,7 +163,7 @@ EvidenceDTO：`id/run_id/paper_id/parsed_document_id/page_number/section/element
 
 保存正文仅允许已有 revision 的 Review；base_revision_number 必须等于最新版本号，否则 409 VERSION_CONFLICT。版本继承原 analysis_revision，不会因人工改字自动升级为新的分析结果。旧 Run 的草稿允许编辑和核验，但保持 stale 提示。
 
-正文限制：新稿固定六个 section_key（background/significance/approach/theoretical_basis/research_status/achievements），对应五个主模块及文献综述的两个子模块。标题和顺序固定，每槽至少一个 block，全稿最多 100 block，每块 1—600 字符。claim 每块恰好引用一条本 Run 的可定位 PDF 证据，并使用完整原句或原段；transition 仅允许独立的“提供的素材中没有该内容。”且无引用。正文不接受任意补写、改写或主观评价。历史五节结构继续兼容读取、编辑和核验，新导出要求重新生成。
+正文限制：新稿固定八个 section_key（background/approach/significance/theoretical_basis/research_status/achievements/limitations/innovation），对应五个主模块、文献综述两个子模块及述评三个子模块。标题和顺序固定，每槽至少一个 block，全稿最多 100 block，每块 1—600 字符。前五槽 claim 每块恰好引用一条本 Run 可定位 PDF 证据，使用完整原句或原段；述评 claim 可引用 1—20 条前文已用证据，必须含对应的 analysis_role；viewpoint_comparison/root_cause 另须有 1—20 的整数 controversy_number 并按争议配对。transition 只允许独立且无引用的“提供的素材中没有该内容。”。历史五节及六槽继续兼容读取、编辑和核验，新导出需八槽；争议不足允许在 Word 明确说明后导出草稿。
 
 ValidationDTO 只针对指定 revision。执行中 `result/structure_passed/blocks` 为 null；成功后 result=`passed|needs_review`，每 block 显示 structure_ok、support、issues、suggestion。support=`supported|unsupported|uncertain|not_applicable`。passed 只是自动核验通过，仍需人工审阅。
 

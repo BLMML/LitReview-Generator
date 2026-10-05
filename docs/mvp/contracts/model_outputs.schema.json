@@ -376,7 +376,9 @@
             "directions",
             "representative_work",
             "disagreements",
-            "trends"
+            "trends",
+            "limitations",
+            "innovation"
           ]
         },
         "title": {
@@ -387,54 +389,91 @@
         "blocks": {
           "type": "array",
           "items": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "kind": {
-                "type": "string",
-                "enum": [
-                  "claim",
-                  "transition"
+            "oneOf": [
+              {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "const": "claim"
+                  },
+                  "source_passage_id": {
+                    "type": "string",
+                    "pattern": "^src_[0-9a-f]{32}$"
+                  }
+                },
+                "required": [
+                  "kind",
+                  "source_passage_id"
                 ]
               },
-              "text": {
-                "type": "string",
-                "maxLength": 600,
-                "minLength": 1
-              },
-              "evidence_ids": {
-                "type": "array",
-                "items": {
-                  "type": "string",
-                  "format": "uuid"
-                },
-                "maxItems": 20
-              }
-            },
-            "required": [
-              "kind",
-              "text",
-              "evidence_ids"
-            ],
-            "allOf": [
               {
-                "if": {
-                  "properties": {
-                    "kind": {
-                      "const": "claim"
-                    }
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "claim",
+                      "transition"
+                    ]
                   },
-                  "required": [
-                    "kind"
-                  ]
+                  "text": {
+                    "type": "string",
+                    "maxLength": 600,
+                    "minLength": 1
+                  },
+                  "evidence_ids": {
+                    "type": "array",
+                    "items": {
+                      "type": "string",
+                      "format": "uuid"
+                    },
+                    "maxItems": 20
+                  },
+                  "analysis_role": {
+                    "type": "string",
+                    "enum": [
+                      "achievement",
+                      "viewpoint_comparison",
+                      "root_cause",
+                      "research_gap",
+                      "future_direction",
+                      "innovation"
+                    ]
+                  },
+                  "controversy_number": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 20
+                  }
                 },
-                "then": {
-                  "properties": {
-                    "evidence_ids": {
-                      "minItems": 1
+                "required": [
+                  "kind",
+                  "text",
+                  "evidence_ids"
+                ],
+                "allOf": [
+                  {
+                    "if": {
+                      "properties": {
+                        "kind": {
+                          "const": "claim"
+                        }
+                      },
+                      "required": [
+                        "kind"
+                      ]
+                    },
+                    "then": {
+                      "properties": {
+                        "evidence_ids": {
+                          "minItems": 1
+                        }
+                      }
                     }
                   }
-                }
+                ]
               }
             ]
           },

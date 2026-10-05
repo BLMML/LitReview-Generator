@@ -47,11 +47,22 @@ from apps.reviews.models import (
     ValidationReport,
 )
 from apps.reviews.schemas import (
+    MAX_BLOCKS_TOTAL,
     SectionsValidationError,
     sections_content_hash,
     validate_sections,
 )
-from apps.reviews.structure import MISSING_CONTENT, SECTION_KEYS, SECTION_TITLES, SOURCE_POLICY
+from apps.reviews.source_selection import SOURCE_SELECTION_REVISION, passage_catalog, resolve_selections
+from apps.reviews.structure import (
+    COMMENTARY_KEYS,
+    COMMENTARY_POLICY,
+    MISSING_CONTENT,
+    SECTION_KEYS,
+    SECTION_TITLES,
+    SOURCE_KEYS,
+    SOURCE_POLICY,
+    commentary_notices,
+)
 
 logger = logging.getLogger("apps.reviews.services")
 
@@ -63,7 +74,7 @@ EVIDENCE_PER_SECTION_MIN = 5
 EVIDENCE_PER_SECTION_MAX = 10
 
 # 生成配置版本：模板或生成参数改变时必须提升
-GENERATION_VERSION = "review-gen-v4-source-passages"
+GENERATION_VERSION = "review-gen-v6-source-selection"
 
 SECTION_REQUIREMENTS = {
     "background": "研究背景：仅摘录文献明确交代的研究背景与问题情境。",
@@ -71,7 +82,15 @@ SECTION_REQUIREMENTS = {
     "approach": "研究思路：仅摘录文献明确说明的研究思路、研究路径与方法安排。",
     "theoretical_basis": "理论基础：仅摘录文献明确采用或阐述的理论基础。",
     "research_status": "国内外研究现状：仅摘录文献对国内外已有研究的陈述，不引入外部文献。",
-    "achievements": "已取得研究成果：仅摘录文献明确记载的已取得成果或研究结果，不添加预测。",
+    "achievements": "已取得的成果：基于前文概括已证实的成果及适用边界，不将计划当成结果。",
+    "limitations": (
+        "文献的不足之处：至少两个真实学术争议；逐个对比观点合理性与局限，分析根本原因。"
+        "同一争议使用相同编号，材料不足不编造。"
+    ),
+    "innovation": (
+        "本文创新点：基于前文争议，分别提出研究空白、未来突破方向与本文拟开展的创新点。"
+        "明确为研究设想，不宣称已经验证、首创或优于既有研究。"
+    ),
 }
 
 
@@ -227,12 +246,12 @@ def _generation_template_version() -> str:
             "research_question": "",
             "output_language": "",
             "corpus_metadata": "",
-            "analysis_summary": "",
             "evidence_package": "",
             "allowed_evidence_ids": "",
             "max_blocks": 1,
             "target_chars": 1,
             "section_target_chars": 1,
+            "prior_sections": "",
         },
         task_type=TASK_REVIEW_SECTION,
     ).version
@@ -247,16 +266,20 @@ def _build_config_snapshot(run: Any, *, review_id: uuid.UUID, target_chars: int)
     # 在 20 个候选的契约上限内尊重更低的部署限制，并记录实际值。
     candidate_limit = min(20, int(retrieval_config["rerank"]["max_candidates"]))
     top_k = min(EVIDENCE_PER_SECTION_MAX, candidate_limit)
-    weights = (15, 15, 15, 15, 20, 20)
+    weights = (12, 12, 12, 12, 16, 10, 16, 10)
     section_targets = {
         key: target_chars * weight // 100 for key, weight in zip(SECTION_KEYS, weights, strict=True)
     }
     section_targets[SECTION_KEYS[-1]] += target_chars - sum(section_targets.values())
     return {
         "version": GENERATION_VERSION,
-        "source_policy": SOURCE_POLICY,
+        "source_policy": COMMENTARY_POLICY,
+        "commentary_min_controversies": 2,
+        "insufficient_commentary_export": "allow_with_notice",
         "location_revision": LOCATION_REVISION,
         "source_quote_revision": SOURCE_QUOTE_REVISION,
+        "source_selection_revision": SOURCE_SELECTION_REVISION,
+        "max_blocks_total": MAX_BLOCKS_TOTAL,
         "template_version": _generation_template_version(),
         "schema_version": SCHEMA_VERSION,
         "model_config": {
@@ -307,7 +330,9 @@ def generate_review(context: ExecutionContext, review_id: Any) -> ReviewRevision
     record_progress(context, stage="freeze_inputs", completed=0, total=len(SECTION_KEYS), unit="section")
     for position, section_key in enumerate(SECTION_KEYS):
         context.ensure_not_cancelled()
-        sections.append(_generate_section(context, review, run, section_key, position, config))
+        sections.append(
+            _generate_section(context, review, run, section_key, position, config, prior_sections=sections)
+        )
         record_progress(context, completed=position + 1)
 
     return _commit_revision(context, review, run, sections, config)
@@ -321,6 +346,8 @@ def _frozen_generation_config(review: Review) -> dict[str, Any]:
     snapshot = review.config_snapshot or {}
     if (
         snapshot.get("version") != GENERATION_VERSION
+        or snapshot.get("source_selection_revision") != SOURCE_SELECTION_REVISION
+        or snapshot.get("max_blocks_total") != MAX_BLOCKS_TOTAL
         or not isinstance(snapshot.get("template_version"), str)
         or any(
             not isinstance(snapshot.get(key), Mapping)
@@ -347,12 +374,26 @@ def _generate_section(
     section_key: str,
     position: int,
     config: Mapping[str, Any],
+    *,
+    prior_sections=None,
 ) -> dict[str, Any]:
     """单节：选证据 → 渲染提示词 → 调用模型 → 校验该节结构。"""
     from apps.llm.schemas import TASK_REVIEW_SECTION
 
     record_progress(context, stage="retrieve_sections", completed=position)
-    package = _section_evidence(context, run, section_key, config)
+    source_sections = [s for s in (prior_sections or []) if s["section_key"] in SOURCE_KEYS]
+    max_blocks = _remaining_section_blocks(config, section_key, prior_sections or [])
+    if section_key in COMMENTARY_KEYS:
+        by_id = {}
+        for section in source_sections:
+            for block in section["blocks"]:
+                for eid in block["evidence_ids"]:
+                    by_id.setdefault(eid, {"evidence_id": eid, "source_passages": []})[
+                        "source_passages"
+                    ].append(block["text"])
+        package = {"chunks": list(by_id.values()), "ids": list(by_id)}
+    else:
+        package = _section_evidence(context, run, section_key, config)
     record_progress(context, stage="generate_sections", completed=position)
     if not package["chunks"]:
         context.ensure_not_cancelled()
@@ -370,19 +411,34 @@ def _generate_section(
             },
             section_key,
             run,
-            max_blocks=int(config["max_blocks_per_section"]),
+            max_blocks=max_blocks,
+            source_sections=source_sections,
         )
 
+    catalog, offered_chunks = (
+        passage_catalog(package["chunks"]) if section_key in SOURCE_KEYS else ({}, package["chunks"])
+    )
     parameters = {
         "section_key": section_key,
         "section_requirement": str(config["section_requirements"][section_key]),
         "research_question": run.research_question,
         "output_language": run.output_language,
         "corpus_metadata": _json(_corpus_metadata(run)),
-        "analysis_summary": _json(_analysis_summary(run)),
-        "evidence_package": _json(package["chunks"]),
+        "prior_sections": _json(
+            [
+                {
+                    "section_key": s["section_key"],
+                    "title": s["title"],
+                    "blocks": [{k: v for k, v in b.items() if k != "block_id"} for b in s["blocks"]],
+                }
+                for s in (prior_sections or [])
+            ]
+            if section_key in COMMENTARY_KEYS
+            else []
+        ),
+        "evidence_package": _json(offered_chunks),
         "allowed_evidence_ids": _json(package["ids"]),
-        "max_blocks": int(config["max_blocks_per_section"]),
+        "max_blocks": max_blocks,
         "target_chars": int(config["target_chars"]),
         "section_target_chars": int(config["section_target_chars"][section_key]),
     }
@@ -406,26 +462,55 @@ def _generate_section(
         context.ensure_not_cancelled()
         try:
             return _validated_section(
-                result.payload, section_key, run, max_blocks=int(config["max_blocks_per_section"])
+                result.payload,
+                section_key,
+                run,
+                max_blocks=max_blocks,
+                source_sections=source_sections,
+                source_catalog=catalog,
             )
         except SectionsValidationError as exc:
             if attempt:
                 raise api_error(
                     "MODEL_OUTPUT_INVALID",
-                    f"{SECTION_TITLES[section_key]}的原文摘录未通过校验：{exc}",
+                    f"{SECTION_TITLES[section_key]}的正文未通过校验：{exc}",
                     {"section_key": section_key},
                     retryable=False,
                 ) from exc
             parameters = {
                 **parameters,
                 "section_requirement": str(config["section_requirements"][section_key])
-                + "\n上次正文未通过原文完整性校验。请重新选择 quotable_passages 中的完整原句或原段，"
-                "禁止使用页首、页尾的半句话，不改写或拼接；没有适合本模块的原句时使用规定的缺失说明。",
+                + (
+                    (
+                        f"\n上次正文校验失败：{exc}。"
+                        "述评请使用合法分析内容、争议编号及前文依据，材料不足使用规定缺失说明。"
+                    )
+                    if section_key in COMMENTARY_KEYS
+                    else (
+                        f"\n上次校验失败：{exc}。只返回本节 quotable_passages 内的 source_passage_id，"
+                        "不要输出 text 或 evidence_ids；没有适合本模块的完整原句时使用规定缺失说明。"
+                    )
+                ),
             }
     raise AssertionError("unreachable")
 
 
-def _validated_section(payload: Any, section_key: str, run: Any, *, max_blocks: int) -> dict[str, Any]:
+def _remaining_section_blocks(config, section_key, prior_sections):
+    """Reserve space for every remaining slot before a model call consumes it."""
+    per_section = int(config["max_blocks_per_section"])
+    used = sum(len(section["blocks"]) for section in prior_sections)
+    minimum = {"achievements": 1, "limitations": 4, "innovation": 3}
+    following = SECTION_KEYS[SECTION_KEYS.index(section_key) + 1 :]
+    reserved = sum(min(per_section, minimum.get(key, 1)) for key in following)
+    available = int(config["max_blocks_total"]) - used - reserved
+    if available < 1:
+        raise SectionsValidationError("全文块数已达到上限，无法保留固定内容槽")
+    return min(per_section, available)
+
+
+def _validated_section(
+    payload: Any, section_key: str, run: Any, *, max_blocks: int, source_sections=None, source_catalog=None
+) -> dict[str, Any]:
     """校验单节输出并补齐后端分配的 block_id。"""
     from apps.analysis.services import _run_scope
 
@@ -441,6 +526,8 @@ def _validated_section(payload: Any, section_key: str, run: Any, *, max_blocks: 
     if isinstance(raw_blocks, (str, bytes)) or not isinstance(raw_blocks, Sequence):
         raise SectionsValidationError(f"{section_key}.blocks 必须是数组")
 
+    raw_blocks = resolve_selections(raw_blocks, section_key, source_catalog or {})
+
     # block_id 由后端分配：模型不参与编号，因此不接受它给出的 ID
     blocks = [
         {
@@ -448,6 +535,11 @@ def _validated_section(payload: Any, section_key: str, run: Any, *, max_blocks: 
             "kind": item.get("kind") if isinstance(item, Mapping) else None,
             "text": item.get("text") if isinstance(item, Mapping) else None,
             "evidence_ids": list(item.get("evidence_ids") or []) if isinstance(item, Mapping) else None,
+            **{
+                key: item[key]
+                for key in ("analysis_role", "controversy_number")
+                if isinstance(item, Mapping) and key in item
+            },
         }
         for item in raw_blocks
     ]
@@ -458,8 +550,15 @@ def _validated_section(payload: Any, section_key: str, run: Any, *, max_blocks: 
         expected_keys=[section_key],
         max_blocks_per_section=max_blocks,
         allow_source_numbers=True,
+        commentary_layout=True,
     )
-    ground_sections(run, validated, rewrite=True)
+    ground_sections(
+        run,
+        validated,
+        rewrite=True,
+        commentary=True,
+        source_sections=source_sections if section_key in COMMENTARY_KEYS else None,
+    )
     return validated[0]
 
 
@@ -570,7 +669,7 @@ def save_revision(
                 run_scope=_run_scope(review.run),
                 expected_keys=[s["section_key"] for s in latest.sections],
             )
-            if latest.config_snapshot.get("source_policy") == SOURCE_POLICY:
+            if latest.config_snapshot.get("source_policy") in (SOURCE_POLICY, COMMENTARY_POLICY):
                 source_citations = ground_sections(review.run, validated)
             else:
                 source_citations = {}
@@ -762,9 +861,9 @@ def create_export(actor: Any, review_id: Any, payload: Mapping[str, Any], key: A
         warnings = export_warnings(revision, report)
         require_acknowledged(warnings, body["acknowledge_warnings"])
         evidence = evidence_snapshot(revision)
-        from apps.reviews.structure import is_source_structure
+        from apps.reviews.structure import is_commentary_structure
 
-        if not is_source_structure(revision.sections):
+        if not is_commentary_structure(revision.sections):
             raise api_error("STRUCTURAL_VALIDATION_FAILED", "此手稿为旧结构，请重新生成以使用固定研究框架")
         snapshot = {
             "title": review.title,
@@ -776,6 +875,7 @@ def create_export(actor: Any, review_id: Any, payload: Mapping[str, Any], key: A
             "content_hash": revision.content_hash,
             "sections": revision.sections,
             "source_citations": ground_sections(revision.run, revision.sections),
+            "commentary_notices": commentary_notices(revision.sections, report.blocks),
             "warnings": warnings,
             "papers": _frozen_bibliography_papers(revision),
             "evidence": evidence,
@@ -1087,38 +1187,6 @@ def _corpus_metadata(run: Any) -> dict[str, Any]:
         "papers": papers,
         "year_counts": year_counts,
         "unknown_year_count": unknown_year,
-    }
-
-
-def _analysis_summary(run: Any) -> dict[str, Any]:
-    """单篇要素、主题归属与争议标签（含人工复核状态）。"""
-    from apps.analysis.models import REVIEW_STATUS_REJECTED, PaperAnalysis
-
-    payloads = {
-        str(item.run_paper.paper_id): item.payload
-        for item in PaperAnalysis.objects.select_related("run_paper").filter(run_paper__run=run)
-    }
-    topics = [
-        {"name": topic.name, "description": topic.description, "paper_ids": list(topic.paper_ids)}
-        for topic in run.topics.order_by("created_at", "id")
-    ]
-    disputes = [
-        {
-            "left_paper_id": str(item.left_paper_id),
-            "right_paper_id": str(item.right_paper_id),
-            "classification": item.classification,
-            "reason": item.reason,
-            "review_status": item.review_status,
-            "conditions": item.conditions,
-            # rejected 候选不得进入结论：这里明确带出状态，由提示词规则约束写法
-            "excluded": item.review_status == REVIEW_STATUS_REJECTED,
-        }
-        for item in run.disputes.order_by("created_at", "id")
-    ]
-    return {
-        "papers": [{"paper_id": key, "analysis": value} for key, value in payloads.items()],
-        "topics": topics,
-        "disputes": disputes,
     }
 
 

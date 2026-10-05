@@ -5443,6 +5443,24 @@
               "format": "uuid"
             },
             "maxItems": 20
+          },
+          "analysis_role": {
+            "type": "string",
+            "enum": [
+              "achievement",
+              "viewpoint_comparison",
+              "root_cause",
+              "research_gap",
+              "future_direction",
+              "innovation"
+            ],
+            "description": "自主述评内容类型，原文模块及缺失说明不得使用。"
+          },
+          "controversy_number": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 20,
+            "description": "同一争议的观点对比与成因使用同一编号；仅适用于这两类述评。"
           }
         },
         "required": [
@@ -5489,7 +5507,9 @@
               "directions",
               "representative_work",
               "disagreements",
-              "trends"
+              "trends",
+              "limitations",
+              "innovation"
             ]
           },
           "title": {
@@ -5541,9 +5561,9 @@
             "items": {
               "$ref": "#/components/schemas/Section"
             },
-            "maxItems": 6,
+            "maxItems": 8,
             "minItems": 5,
-            "description": "固定新研究框架六个内容槽；旧五节仅供历史兼容。"
+            "description": "新稿固定八个内容槽：研究背景、研究思路、研究意义、理论基础、国内外研究现状、已取得的成果、文献的不足之处、本文创新点。历史五节及六槽只供查看与编辑；新导出必须使用八槽。"
           },
           "source": {
             "type": "string",
@@ -6334,9 +6354,9 @@
             "items": {
               "$ref": "#/components/schemas/Section"
             },
-            "maxItems": 6,
+            "maxItems": 8,
             "minItems": 5,
-            "description": "固定新研究框架六个内容槽；旧五节仅供历史兼容。"
+            "description": "新稿固定八个内容槽：研究背景、研究思路、研究意义、理论基础、国内外研究现状、已取得的成果、文献的不足之处、本文创新点。历史五节及六槽只供查看与编辑；新导出必须使用八槽。"
           }
         },
         "required": [

@@ -144,6 +144,14 @@ export type Block = {
   kind: 'claim' | 'transition'
   text: string
   evidence_ids: Array<string>
+  analysis_role?:
+    | 'achievement'
+    | 'viewpoint_comparison'
+    | 'root_cause'
+    | 'research_gap'
+    | 'future_direction'
+    | 'innovation'
+  controversy_number?: number
 }
 export type Section = {
   section_key:
@@ -157,6 +165,8 @@ export type Section = {
     | 'representative_work'
     | 'disagreements'
     | 'trends'
+    | 'limitations'
+    | 'innovation'
   title: string
   blocks: Array<Block>
 }

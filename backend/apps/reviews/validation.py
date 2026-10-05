@@ -16,7 +16,7 @@ from apps.llm.prompt_loader import load_prompt
 from apps.llm.schemas import TASK_VERIFY_BLOCKS, ModelTaskRequest, output_schema, validate_payload
 from apps.reviews.schemas import SectionsValidationError, validate_sections
 
-VALIDATION_VERSION = "review-validation-v1"
+VALIDATION_VERSION = "review-validation-v2-commentary"
 VALIDATE_PROMPT = "validate_claims.md"
 # 只有确定的纯承接语允许自动接受 not_applicable，其它情况保守交给人工。
 PURE_TRANSITIONS = frozenset(
@@ -220,20 +220,49 @@ def validate_claim_support(
     """按冻结的批大小核验；逻辑调用 ID 在失败重试中稳定，无正文改写。"""
     by_id = {e["evidence_id"]: e for e in evidence}
     blocks = revision_blocks(revision)
-    from apps.reviews.structure import SOURCE_POLICY, is_source_structure
+    from apps.reviews.structure import (
+        COMMENTARY_KEYS,
+        COMMENTARY_POLICY,
+        SOURCE_POLICY,
+        is_commentary_structure,
+        is_source_structure,
+    )
 
     module_by_block = {
-        b["block_id"]: (s["section_key"], s["title"])
-        for s in revision.sections
-        for b in s["blocks"]
+        b["block_id"]: (s["section_key"], s["title"]) for s in revision.sections for b in s["blocks"]
     }
-    source_policy = SOURCE_POLICY if is_source_structure(revision.sections) else "legacy"
+    commentary = is_commentary_structure(revision.sections)
+    source_policy = (
+        COMMENTARY_POLICY
+        if commentary
+        else SOURCE_POLICY
+        if is_source_structure(revision.sections)
+        else "legacy"
+    )
+    source_passages = {}
+    for section in revision.sections:
+        if commentary and section["section_key"] not in COMMENTARY_KEYS:
+            for block in section["blocks"]:
+                for eid in block["evidence_ids"]:
+                    source_passages.setdefault(eid, []).append(block["text"])
+    commentary_context = [
+        {k: b[k] for k in ("text", "analysis_role", "controversy_number") if k in b}
+        for s in revision.sections
+        if commentary and s["section_key"] in COMMENTARY_KEYS
+        for b in s["blocks"]
+    ]
     prepared = [
         {
             **b,
             "section_key": module_by_block[b["block_id"]][0],
             "section_title": module_by_block[b["block_id"]][1],
             "source_policy": source_policy,
+            "content_mode": "autonomous_commentary"
+            if commentary and module_by_block[b["block_id"]][0] in COMMENTARY_KEYS
+            else "source_excerpt",
+            "commentary_context": commentary_context
+            if commentary and module_by_block[b["block_id"]][0] in COMMENTARY_KEYS
+            else [],
             "evidence": [
                 {
                     "evidence_id": eid,
@@ -241,6 +270,7 @@ def validate_claim_support(
                     "page_number": by_id[eid]["page_number"],
                     "text": by_id[eid]["original_text"] or by_id[eid]["text"],
                     "verification": by_id[eid]["verification"],
+                    "source_passages": source_passages.get(eid, []),
                 }
                 for eid in b["evidence_ids"]
             ],
