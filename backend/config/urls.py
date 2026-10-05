@@ -5,7 +5,7 @@
 - 只引用各 app 的 API 入口，不在这里写视图逻辑；
 - 不额外开放通用模型 CRUD。
 
-操作数应与 docs/mvp/contracts/openapi.json 的 43 个 operation 一一对应。
+操作数应与 docs/mvp/contracts/openapi.json 的 45 个 operation 一一对应。
 """
 
 from __future__ import annotations

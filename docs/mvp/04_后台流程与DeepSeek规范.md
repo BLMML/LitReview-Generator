@@ -32,6 +32,7 @@ flowchart LR
 | --- | --- | --- |
 | projects.services.create_project / update_project | actor_id、已校验字段、expected_version | Project；锁版本，问题变化递增 corpus_revision |
 | literature.services.upload_pdf | actor_id、project_id、文件流、metadata、幂等键 | Paper；文件先暂存校验，事务登记，重复哈希复用 |
+| literature.services.delete_paper | actor_id、paper_id、expected_version | Project → Paper 锁，空闲 / 版本检查，逻辑删除、释放名额、递增语料版本；保留历史产物 |
 | literature.services.import_arxiv / execute_import_arxiv | 受理：actor、project_id、arxiv_ids、key；执行：context、import_batch_id（首次 Job ID） | 受理返回 Job；执行保存逐项账本，仅成功文件创建 Paper |
 | analysis.services.create_run | actor_id、project_id、幂等键 | 事务内冻结 Run/RunPaper、创建 analyze Job |
 | analysis.services.execute_run | context、run_id | 逐阶段保存；最终 ready 或 failed/cancelled |
@@ -39,7 +40,7 @@ flowchart LR
 | retrieval.services.retrieve_evidence | run_id、query、candidate_limit、top_k、ExecutionContext | 证据 hit 列表；内部函数不创建 Job |
 | retrieval.services.create_retrieval / execute_retrieval | actor / run / 请求；或 context、retrieval_id | 预建资源与 Job；执行后填入 results |
 | reviews.services.create_review | actor_id、run_id、生成配置、幂等键 | Review 无正文 + generate_review Job |
-| reviews.services.generate_review | context、review_id | 合法五节正文一次性提交 revision 1 |
+| reviews.services.generate_review | context、review_id | 合法固定框架正文一次性提交 revision 1 |
 | reviews.services.save_revision | actor_id、review_id、base_revision_number、sections | 新不可变 revision；不触发模型调用 |
 | reviews.services.validate_revision | context、validation_id | 针对固定正文版本的 ValidationReport |
 | reviews.services.export_revision | context、export_id | 临时 DOCX → 完成后原子发布文件与 Export.ready |
@@ -55,7 +56,7 @@ flowchart LR
 
 | stage | 输入 | 操作 | 提交产物与恢复点 |
 | --- | --- | --- | --- |
-| snapshot | 当前项目与纳入论文 | 冻结研究问题、元数据、哈希、配置及模板版本 | Run + RunPaper；之后只读快照 |
+| snapshot | 当前项目与未删除的纳入论文 | 冻结研究问题、元数据、哈希、配置及模板版本 | Run + RunPaper；之后只读快照，后续删除 / 恢复不改旧快照 |
 | parse | 单篇 PDF | 文本提取、复杂页渲染与辅助识别、片段切分 | 完整 ParsedDocument + Chunks；不发布半成品 |
 | extract | 单篇证据 | DeepSeek 要素与单篇摘要，原文引用检查 | PaperAnalysis + RunPaper.ready |
 | index | 本 Run 可用片段 | 建词频索引与 evidence_id 行号映射 | Run 专属索引文件与 manifest |
@@ -86,10 +87,12 @@ parse 页级中间文件可暂存，但只有全部页完成才发布 ParsedDocu
 
 `freeze_inputs → retrieve_sections → generate_sections → check_structure → commit_revision`。
 
-- 固定五节，逐节构造问题和证据包；每节最多 20 个候选重排，再选 5—10 个证据作为初始生成上下文，实际参数保存在任务快照。
+- 固定六个内容槽（五个主模块含两个文献综述子模块），逐槽构造问题和证据包；每节最多 20 个候选重排，再选 5—10 个证据作为初始生成上下文，实际参数保存在任务快照。
+- `review-gen-v4-source-passages` 在每条证据中加入 `quotable_passages`：PDF 几何定位得到的完整原句或原段，每项不超过 600 字符，排除截断尾句及可能续接前页的首句。冻结提取策略 `complete-pdf-passages-v1`；上下文原文仍保留。
+- 逐节生成后继续执行原文及位置校验。失败只允许一次明确要求完整原文的修复调用，修复身份由 Review 与内容槽稳定派生；再次失败返回 `MODEL_OUTPUT_INVALID` 和具体模块，不提交空白正文。正常完整句子可以从段首“摘要：”标签之后或前句脚注角标之后开始；不得删去普通条件前缀。
 - 每节输入包含真实题录、单篇要素、主题、已复核 / 未复核争议标签、该语料年份统计与 evidence ID。
 - DeepSeek 返回 block 的 kind/text/evidence_ids；block_id 由后端分配。生成模板不允许 HTML、虚构参考文献编号和外部“记忆中的论文”。
-- 全部五节的结构、引用范围和 block 数限制通过后，一次性创建 revision 1；部分章节只存在任务中间产物，失败不暴露为完整正文。
+- 全部内容槽的结构、引用范围和 block 数限制通过后，一次性创建 revision 1；部分章节只存在任务中间产物，失败不暴露为完整正文。
 - 生成时记录语料版本、analysis_revision、模板和模型配置。取消或旧 worker 的迟到响应不得覆盖新结果。
 
 ### 5.2 保存与核验
@@ -104,9 +107,11 @@ parse 页级中间文件可暂存，但只有全部页完成才发布 ParsedDocu
 
 核验请求本身失败时 Job.failed，报告结果保持 null，不能伪装为 needs_review 已完成。成功报告必须覆盖每个 block 恰好一次；有事实的 transition 不能用 not_applicable 绕过检查。
 
+M11 受理时冻结提示词、Schema 摘要、模型、语言、批大小、输入上限和证据摘要。默认每批最多 5 个 block，并按完整系统提示词、Schema、原文和格式修复预留的 UTF-8 保守上界进一步分批；单块完整引用仍超限时明确失败，不截断证据。逻辑调用身份由报告 ID 与批次派生，失败重试保持不变。无引用的事实块不能判为 supported；无法确定为纯承接语或引用 image_unverified 的块保守为 uncertain，要求人工回看。
+
 ### 5.3 导出
 
-在受理时验证 revision 与 validation 的关联、完成状态、结构结果及警示确认；冻结这些输入，执行时再核对完整性。只用冻结元数据排参考文献，按首次引用去重编号。正文、参考文献、页级证据附表、AI 草稿标识及未解决问题一并输出。
+在受理时验证 revision 与 validation 的关联、完成状态、结构结果及警示确认；冻结这些输入，执行时再核对完整性。只用冻结元数据排参考文献，按首次引用去重编号。Word 正文仅输出固定研究框架、原文及真实 PDF 页段行出处；缺失内容只输出规定提示。参考文献排序、报告和警示在后台保留，不进入正文。
 
 文件写入临时路径并完整关闭、检查可打开后，再改为正式路径并登记 FileAsset。失败文件不对外可见；导出重试可清理本任务自己的临时文件，不能删除别的任务产物。
 
@@ -148,7 +153,7 @@ parse 页级中间文件可暂存，但只有全部页完成才发布 ParsedDocu
 - 模型请求总超时 120 秒，单逻辑调用最多 3 次网络尝试，包含一次格式修复在内；指数退避并加随机扰动，尊重 Retry-After。
 - HTTP 鉴权错误、无效参数、余额不足不自动重复；超时、暂时性限流 / 服务故障有限重试。图片或长输出超限需重新分批，不原样无限重发。
 - 初始每次最多 2 张页面图像、每张不超过 5 MiB；图像缩放不能损害关键文字，不能满足可读性时分区域或报错。此为项目限制，不是对供应商上限的声明。
-- 文字按章节 / 证据包控制，每次初始输入预算 24,000 token、输出预算 4,096 token；思考输出受此限制时应调小任务或调整已批准预算，禁止静默截断。
+- 文字按章节 / 证据包控制；2026-10-02 用户授权将单次保守输入上限从 24,000 调整为 256,000，随后追加要求支持三万字，现为 384,000，以容纳单篇原文、引用元数据和双篇比较。网关按完整提示词 UTF-8 字节数加封装余量检查；输出上限保持 4,096，项目金额预算保持不变。2—30 篇分析的主题归纳按数量与实际大小分批，全部候选主题再统一归纳；同主题争议比较覆盖全部成员及跨批次论文组合，比较素材为完整单篇要素和其中引用的完整证据片段。单篇全文、最终汇总或两篇必要比较依据仍超限时明确失败，禁止静默截断。思考输出受此限制时应调小任务或调整已批准预算。
 - 本地切片器保留章节、真实页码及相邻上下文；MVP 先试每片 600—1,200 中文字符或等价英文长度，跨页段落拆分并显式关联，不伪造单页坐标。
 
 ## 7. 费用、缓存与日志

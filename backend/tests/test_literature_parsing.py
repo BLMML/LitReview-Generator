@@ -1,4 +1,4 @@
-"""文献接入与解析测试（docs/mvp/01 第 9 节、docs/mvp/05 T03 / T04）。
+"""文献接入与解析测试（docs/mvp/01 第 9 节、docs/mvp/05 T03 / T04 / T09）。
 
 M05「文献接入与文件授权」覆盖：
 - PDF 大小 / 页数 / 加密 / 损坏的拒绝与返回码；
@@ -7,9 +7,12 @@ M05「文献接入与文件授权」覆盖：
 - 单项目 30 篇上限；
 - arXiv 受理账本、部分失败保留成功项、重试只补 pending/failed 且沿用已解析版本。
 
-仍为显式 skip 的 3 项属于 M06「解析与证据账本」（页级证据、复杂页显式失败、
-视觉转录默认未核验），实现对应阶段后再逐条打开——它们不是通过，
-只是把「没实现」写成可见的待办（docs/mvp/01 第 9 节）。
+M06「解析与证据账本」覆盖（末尾 3 条，已从 skip 打开）：
+- 页级证据 page_number 从 1 起且与原文一致；
+- 无法识别的复杂页显式失败，不补造内容；
+- 视觉转录默认 `image_unverified`，应用绝不自动设为 `human_verified`。
+
+更细的切片、locator、跨 Run 引用等断言在 `tests/test_parsing_evidence.py`。
 """
 
 from __future__ import annotations
@@ -17,17 +20,30 @@ from __future__ import annotations
 import uuid
 
 import pytest
-from tests.conftest import make_pdf_bytes, make_pdf_file
+from tests.conftest import make_pdf_bytes, make_pdf_file, make_text_pdf_file
 
 from apps.common.http import ApiError
-
-PENDING_M06 = "MVP 骨架阶段：parsing 解析与证据账本属于 M06，见 docs/mvp/05 阶段 C"
 
 pytestmark = pytest.mark.django_db
 
 
 def _key() -> str:
     return str(uuid.uuid4())
+
+
+class _Snapshot:
+    """`parse_paper` 需要的论文快照；字段与 RunPaper 对齐。"""
+
+    def __init__(self, paper):
+        self.paper_id = paper.id
+        self.project_id = paper.project_id
+        self.file_asset = paper.file_asset
+        self.file_sha256 = paper.file_sha256
+        self.title = paper.title
+
+
+def _snapshot(paper):
+    return _Snapshot(paper)
 
 
 def _upload(client, project, *, key=None, file=None, title=None, **extra):
@@ -77,9 +93,7 @@ def test_pdf_page_limit_is_422(client_a, project_a, settings):
 
 def test_encrypted_pdf_is_422(client_a, project_a):
     """加密 PDF 一律拒绝，即使口令是空串也不进入流程。"""
-    response = _upload(
-        client_a, project_a, file=make_pdf_file(1, name="locked.pdf", encrypt="secret")
-    )
+    response = _upload(client_a, project_a, file=make_pdf_file(1, name="locked.pdf", encrypt="secret"))
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "UNSUPPORTED_PDF"
 
@@ -90,9 +104,7 @@ def test_broken_pdf_is_422(client_a, project_a):
 
     from apps.literature.models import Paper
 
-    fake = SimpleUploadedFile(
-        "fake.pdf", b"this is definitely not a pdf", content_type="application/pdf"
-    )
+    fake = SimpleUploadedFile("fake.pdf", b"this is definitely not a pdf", content_type="application/pdf")
     response = _upload(client_a, project_a, file=fake)
     assert response.status_code == 422
     assert response.json()["error"]["code"] == "UNSUPPORTED_PDF"
@@ -107,9 +119,7 @@ def test_upload_rejects_path_traversal_filename_without_escaping_storage(client_
     """路径穿越文件名只保留基名，绝不参与磁盘路径拼接。"""
     from apps.literature.models import Paper
 
-    response = _upload(
-        client_a, project_a, file=make_pdf_file(1, name="../../../../etc/passwd.pdf")
-    )
+    response = _upload(client_a, project_a, file=make_pdf_file(1, name="../../../../etc/passwd.pdf"))
     assert response.status_code == 201
     paper = Paper.objects.get()
     assert paper.file_asset.original_filename == "passwd.pdf"
@@ -356,9 +366,7 @@ def test_arxiv_partial_failure_keeps_successful_items(client_a, project_a, monke
         "fetch_metadata",
         lambda arxiv_id: _arxiv_metadata(arxiv_id if "v" in arxiv_id else f"{arxiv_id}v2"),
     )
-    monkeypatch.setattr(
-        literature.arxiv_client, "download_pdf", _fake_download(fail_for={"2401.00002v2"})
-    )
+    monkeypatch.setattr(literature.arxiv_client, "download_pdf", _fake_download(fail_for={"2401.00002v2"}))
 
     job = Job.objects.get(pk=accepted["job_id"])
     context = claim_execution(job.pk)
@@ -408,9 +416,7 @@ def test_arxiv_retry_only_fills_pending_and_failed(client_a, project_a, monkeypa
     assert Paper.objects.count() == 1
 
     # 重试：新 Job、同一 resource_id，沿用已解析版本
-    retry = client_a.post(
-        f"/api/v1/jobs/{job.id}/retry", format="json", HTTP_IDEMPOTENCY_KEY=_key()
-    )
+    retry = client_a.post(f"/api/v1/jobs/{job.id}/retry", format="json", HTTP_IDEMPOTENCY_KEY=_key())
     assert retry.status_code == 202
     retry_data = retry.json()["data"]
     assert retry_data["resource_id"] == accepted["resource_id"]
@@ -601,17 +607,99 @@ def test_arxiv_cancellation_stops_remaining_items(client_a, project_a, user_a, m
     assert not Paper.objects.filter(project=project_a).exists(), "取消后仍写入了文献"
 
 
-# ── M06：解析与证据账本（尚未实现，保持显式 skip）─────────────
-@pytest.mark.skip(reason=PENDING_M06)
-def test_evidence_page_numbers_start_at_one():
-    raise AssertionError("待实现：页级证据 page_number 从 1 起且与原文一致")
+# ── M06：解析与证据账本（已实现，见 tests/test_parsing_evidence.py）────
+def test_evidence_page_numbers_start_at_one(client_a, project_a):
+    """页级证据的 page_number 从 1 起，且片段文本确实来自该页原文。"""
+    from apps.literature.models import Paper
+    from apps.parsing.evidence import build_chunks
+    from apps.parsing.models import EvidenceChunk
+    from apps.parsing.pdf import extract_pages
+    from apps.parsing.services import parse_paper
+
+    body = "Attention Is All You Need\nAbstract: the dominant sequence model."
+    response = _upload(client_a, project_a, file=make_text_pdf_file([body], name="one-page.pdf"))
+    assert response.status_code == 201, response.json()
+    paper = Paper.objects.select_related("file_asset").get(pk=response.json()["data"]["id"])
+
+    document = parse_paper(
+        None,
+        _snapshot(paper),
+        {},
+    )
+    chunks = list(EvidenceChunk.objects.filter(parsed_document=document).order_by("ordinal"))
+    assert chunks, "没有生成证据片段"
+    assert [chunk.ordinal for chunk in chunks] == list(range(1, len(chunks) + 1))
+    assert {chunk.page_number for chunk in chunks} == {1}, "页码必须从 1 起且指向真实页"
+
+    # 片段必须能在该页原文中找到，而不是模型改写后的自证文本
+    page_text = " ".join(extract_pages(paper.file_asset)[0].text.split())
+    for chunk in chunks:
+        assert " ".join(chunk.text.split()) in page_text
+    assert build_chunks  # 该入口与 parse_paper 共用同一实现
 
 
-@pytest.mark.skip(reason=PENDING_M06)
-def test_unrecognized_page_fails_explicitly():
-    raise AssertionError("待实现：无法识别的复杂页显式失败，不补造内容")
+def test_unrecognized_page_fails_explicitly(client_a, project_a):
+    """无法识别的复杂页显式失败：不发布产物、不产生片段、不补造内容。"""
+    from tests.conftest import make_pdf_file
+
+    from apps.literature.models import Paper
+    from apps.parsing.models import EvidenceChunk, ParsedDocument
+    from apps.parsing.services import parse_paper
+
+    # 没有文本层的 PDF：解析器读不出内容，也不启用图像辅助
+    response = _upload(client_a, project_a, file=make_pdf_file(1, name="no-text.pdf"))
+    assert response.status_code == 201, response.json()
+    paper = Paper.objects.select_related("file_asset").get(pk=response.json()["data"]["id"])
+
+    with pytest.raises(ApiError) as error:
+        parse_paper(None, _snapshot(paper), {})
+
+    assert error.value.code == "PDF_PARSE_FAILED"
+    assert [item["page_number"] for item in error.value.details["pages"]] == [1]
+    assert not ParsedDocument.objects.exists(), "失败时不得发布解析产物"
+    assert not EvidenceChunk.objects.exists(), "失败时不得产生任何片段"
 
 
-@pytest.mark.skip(reason=PENDING_M06)
-def test_image_transcription_is_unverified_by_default():
-    raise AssertionError("待实现：视觉转录 verification=image_unverified，不自动设为 human_verified")
+def test_image_transcription_is_unverified_by_default(client_a, project_a, monkeypatch):
+    """视觉转录的 verification=image_unverified，应用绝不自动设为 human_verified。"""
+    import uuid as uuid_module
+
+    from tests.conftest import make_pdf_file
+
+    from apps.literature.models import Paper
+    from apps.parsing import services as parsing_services
+    from apps.parsing.models import (
+        VERIFICATION_HUMAN_VERIFIED,
+        VERIFICATION_IMAGE_UNVERIFIED,
+        EvidenceChunk,
+    )
+
+    response = _upload(client_a, project_a, file=make_pdf_file(1, name="scan.pdf"))
+    assert response.status_code == 201, response.json()
+    paper = Paper.objects.select_related("file_asset").get(pk=response.json()["data"]["id"])
+
+    from apps.jobs.models import Job
+    from apps.jobs.services import claim_execution
+
+    job = Job.objects.create(
+        project_id=paper.project_id,
+        requested_by=paper.project.owner,
+        kind="analyze",
+        resource_type="analysis_run",
+        resource_id=uuid_module.uuid4(),
+        input_hash="0" * 64,
+    )
+    context = claim_execution(job.pk)
+
+    class _FakeResult:
+        payload = {"elements": [{"element_type": "text", "text": "Scanned line", "section": None}]}
+
+    monkeypatch.setattr(parsing_services, "call_structured", lambda ctx, req: _FakeResult())
+
+    document = parsing_services.parse_paper(context, _snapshot(paper), {})
+    chunks = EvidenceChunk.objects.filter(parsed_document=document)
+    assert chunks.exists(), "图像辅助路径没有产出片段"
+    for chunk in chunks:
+        assert chunk.verification == VERIFICATION_IMAGE_UNVERIFIED
+        assert chunk.verification != VERIFICATION_HUMAN_VERIFIED
+        assert chunk.original_text is None, "图像转录不得伪称与原文匹配"

@@ -263,19 +263,26 @@ def main() -> int:
     )
     check("非法 Idempotency-Key → 400", status == 400, f"got {status}")
 
-    # 带上合法幂等键才会进入服务层；该阶段尚未实现，应明确 503
+    # 带上合法幂等键才会进入服务层。M07 已实现分析受理，因此这里不再是 503，
+    # 而是真实的业务前置校验：该走查项目没有纳入文献，必须明确拒绝。
     status, body = a.call(
         f"/projects/{project_id}/runs",
         "POST",
         {},
         extra_headers={"Idempotency-Key": str(uuid.uuid4())},
     )
-    check("创建 Run → 503（未实现，阶段 C）", status == 503, f"got {status} {error_code(body)}")
-    check("未实现也走统一 envelope", error_code(body) == "SERVICE_UNAVAILABLE", error_code(body))
+    check("文献不足时创建 Run → 422", status == 422, f"got {status} {error_code(body)}")
+    check("错误码 INSUFFICIENT_PAPERS", error_code(body) == "INSUFFICIENT_PAPERS", error_code(body))
     check(
-        "未实现不伪装成成功，也不返回 data",
+        "被拒绝时不伪装成成功，也不返回 data",
         "data" not in body and body["error"]["retryable"] is False,
         str(body)[:120],
+    )
+    check(
+        "错误详情给出纳入篇数与门槛",
+        body["error"]["details"].get("included_count") == 0
+        and isinstance(body["error"]["details"].get("required"), int),
+        str(body["error"]["details"])[:120],
     )
 
     print()

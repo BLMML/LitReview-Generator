@@ -592,7 +592,7 @@ def test_arxiv_import_is_idempotent_on_replay(client_a, project_a, monkeypatch):
 
 # ── 路由表完整性 ──────────────────────────────────────────────
 def test_all_contract_routes_are_mounted():
-    """43 个 HTTP 操作对应的路由都应存在，且不带尾斜杠。"""
+    """45 个 HTTP 操作对应的路由都应存在，且不带尾斜杠。"""
     from django.urls import get_resolver
 
     # 路由表按 app 分成多个 include，全部挂在同一个 /api/v1/ 前缀下
@@ -647,3 +647,104 @@ def test_all_contract_routes_are_mounted():
     missing = expected - set(mounted)
     assert not missing, f"缺少路由：{sorted(missing)}"
     assert all(not item.endswith("/") for item in mounted), "路由不得带尾斜杠"
+
+
+# `03` 为每条路径规定的方法集合。只断言"路径存在"不够：
+# `runs/{id}/retrievals` 曾经只挂了 POST 的 create 视图，GET 落进 405 兜底分支，
+# 而当时的路由测试因为只看路径，完全没有发现这个缺口。
+EXPECTED_METHODS: dict[str, set[str]] = {
+    "auth/csrf": {"GET"},
+    "auth/login": {"POST"},
+    "auth/logout": {"POST"},
+    "auth/me": {"GET"},
+    "projects": {"GET", "POST"},
+    "projects/<uuid:project_id>": {"GET", "PATCH", "DELETE"},
+    "projects/<uuid:project_id>/papers": {"GET"},
+    "projects/<uuid:project_id>/papers/upload": {"POST"},
+    "projects/<uuid:project_id>/imports/arxiv": {"POST"},
+    "projects/<uuid:project_id>/runs": {"GET", "POST"},
+    "projects/<uuid:project_id>/jobs": {"GET"},
+    "papers/<uuid:paper_id>": {"GET", "PATCH"},
+    "papers/<uuid:paper_id>/file": {"GET"},
+    "runs/<uuid:run_id>": {"GET"},
+    "runs/<uuid:run_id>/papers/<uuid:paper_id>/analysis": {"GET"},
+    "runs/<uuid:run_id>/papers/<uuid:paper_id>/evidence": {"GET"},
+    "runs/<uuid:run_id>/topics": {"GET"},
+    "runs/<uuid:run_id>/disputes": {"GET"},
+    "runs/<uuid:run_id>/evidence/<uuid:evidence_id>": {"GET"},
+    "disputes/<uuid:dispute_id>": {"PATCH"},
+    "runs/<uuid:run_id>/retrievals": {"GET", "POST"},
+    "retrievals/<uuid:retrieval_id>": {"GET"},
+    "jobs/<uuid:job_id>": {"GET"},
+    "jobs/<uuid:job_id>/cancel": {"POST"},
+    "jobs/<uuid:job_id>/retry": {"POST"},
+}
+
+
+def test_core_routes_expose_every_contract_method():
+    """契约规定的每个方法都必须真的被某个视图处理。
+
+    用 `resolve()` 取路径的候选视图，并读取 `cls.actions` / `initkwargs.method`
+    判断支持的 HTTP 方法；两者都拿不到时至少要求候选视图存在。
+    """
+    from django.urls import resolve
+
+    problems: list[str] = []
+    for pattern, methods in EXPECTED_METHODS.items():
+        concrete = pattern.replace("<uuid:project_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:paper_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:run_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:evidence_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:dispute_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:retrieval_id>", str(uuid.uuid4()))
+        concrete = concrete.replace("<uuid:job_id>", str(uuid.uuid4()))
+        try:
+            match = resolve(f"/api/v1/{concrete}")
+        except Exception as exc:  # noqa: BLE001
+            problems.append(f"{pattern}: 无法解析（{type(exc).__name__}）")
+            continue
+
+        func = match.func
+        supported: set[str] = set()
+        actions = getattr(getattr(func, "cls", None), "actions", None)
+        if isinstance(actions, dict):
+            supported = {method.upper() for method in actions}
+        else:
+            declared = getattr(func, "initkwargs", {}).get("method")
+            allowed = getattr(func, "allowed_methods", None)
+            if declared:
+                supported = {str(declared).upper()}
+            elif allowed:
+                supported = {str(item).upper() for item in allowed}
+
+        # 无法静态判断时不误报：只要求候选视图存在
+        if supported and not methods <= supported:
+            problems.append(f"{pattern}: 缺少 {sorted(methods - supported)}（实际 {sorted(supported)}）")
+
+    assert not problems, "契约方法未全部挂载：\n" + "\n".join(problems)
+
+
+@pytest.mark.parametrize(
+    "path_template",
+    [
+        "runs/{run}/retrievals",
+        "projects/{project}/runs",
+        "projects/{project}/papers",
+        "runs/{run}/topics",
+        "runs/{run}/disputes",
+    ],
+)
+def test_documented_get_routes_are_not_method_not_allowed(client_a, api_v1, path_template, project_a):
+    """行为级验证：契约里的 GET 路径不得返回 405。
+
+    **必须用已登录请求**：未登录时 401 与 405 都来自 DRF 的方法分发检查，
+    两者无法区分。已登录后，方法存在 → 正常业务响应（200/404 等）；
+    方法不存在 → 405 会盖过 404。
+
+    这正是 `runs/{id}/retrievals` 曾经的形态：路径存在、只挂了 POST，
+    GET 落到 405 兜底分支，而只检查路径是否存在的路由测试发现不了。
+    """
+    path = path_template.format(run=str(uuid.uuid4()), project=str(project_a.id))
+    response = client_a.get(f"{api_v1}/{path}")
+
+    assert response.status_code != 405, f"GET {path} 返回 405：该方法未挂载视图"

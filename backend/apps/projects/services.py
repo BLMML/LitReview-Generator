@@ -4,6 +4,7 @@
 - 创建项目；
 - 编辑时锁 Project、检查空闲与 expected_version；
 - 研究问题变化递增 corpus_revision。
+- 删除时锁 Project，检查空闲、项目和语料版本；逻辑删除并保留历史与账本。
 
 事务边界遵循 docs/mvp/01 第 7.2 节：短事务内完成校验与版本递增，不跨外部请求持锁。
 """
@@ -16,6 +17,7 @@ from typing import Any
 from django.apps import apps
 from django.conf import settings
 from django.db import transaction
+from django.utils import timezone
 
 from apps.common.auth import ActorContext
 from apps.common.http import api_error
@@ -95,3 +97,29 @@ def update_project(
         project.version += 1
         project.save(update_fields=[*dirty_fields, "version", "corpus_revision", "updated_at"])
         return project
+
+
+@transaction.atomic
+def delete_project(
+    actor: ActorContext, project_id: Any, expected_version: int, expected_corpus_revision: int
+) -> dict[str, Any]:
+    """Hide a whole project without destroying its immutable history or usage ledger.
+
+    Serialize with every material edit and task acceptance on the Project lock.
+    Repeated deletion by the owner is a no-op; no restore endpoint is exposed.
+    """
+    project = lock_project(project_id, owner=actor.user, include_deleted=True)
+    result = {"project_id": str(project.pk), "deleted": True}
+    if project.deleted_at is not None:
+        return result
+    require_project_idle(project)
+    if project.version != expected_version or project.corpus_revision != expected_corpus_revision:
+        raise api_error(
+            "VERSION_CONFLICT",
+            "项目或文献已更新，请重新读取项目后再确认删除",
+            {"current_version": project.version, "current_corpus_revision": project.corpus_revision},
+        )
+    project.deleted_at = timezone.now()
+    project.version += 1
+    project.save(update_fields=["deleted_at", "version", "updated_at"])
+    return result

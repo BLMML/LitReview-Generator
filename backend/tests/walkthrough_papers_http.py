@@ -470,8 +470,17 @@ def main() -> int:
             if job["status"] == "queued":
                 print("      注意：任务仍在 queued。启动 worker 后重跑本步可看到终态：")
                 print("        python -m celery -A config worker --pool=solo --loglevel=INFO")
-                check("未执行时 result 为 null（不伪装成成功）", job.get("result") is None,
-                      json.dumps(job.get("result"))[:120])
+                # 受理时就会写入逐项 pending 账本（03 §2.2 要求受理即可见）。
+                # 未执行 ≠ 无账本：账本存在，但每一项都必须是 pending，
+                # 且 Job 不能处于终态——不把"尚未执行"渲染成成功。
+                items = (job.get("result") or {}).get("items")
+                check("排队期间即暴露逐项账本", isinstance(items, list) and len(items) == 2,
+                      json.dumps(job.get("result"))[:150])
+                check("未执行时每项都是 pending",
+                      bool(items) and all(item["status"] == "pending" for item in items),
+                      json.dumps(items)[:150])
+                check("未执行时不得为终态", job["status"] not in {"succeeded", "failed", "cancelled"},
+                      job["status"])
             else:
                 items = (job.get("result") or {}).get("items") or []
                 check("终态带回逐项账本", len(items) == 2, json.dumps(job.get("result"))[:150])

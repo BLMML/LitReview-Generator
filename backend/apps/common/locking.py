@@ -30,7 +30,7 @@ def _job_model() -> Any:
     return apps.get_model("jobs", "Job")
 
 
-def lock_project(project_id: Any, *, owner: Any | None = None) -> Any:
+def lock_project(project_id: Any, *, owner: Any | None = None, include_deleted: bool = False) -> Any:
     """在事务内锁定 Project 行并返回它。
 
     - 必须在 `transaction.atomic()` 内调用，否则并发受理无法收敛；
@@ -42,6 +42,10 @@ def lock_project(project_id: Any, *, owner: Any | None = None) -> Any:
     queryset = _project_model().objects.select_for_update()
     if owner is not None:
         queryset = queryset.filter(owner=owner)
+        if not include_deleted:
+            queryset = queryset.filter(deleted_at__isnull=True)
+    # 无 owner 的内部结算仍可锁住已删除项目，避免丢失未结算账本。
+    # include_deleted 仅供归属校验后的重复删除使用。
     project = queryset.filter(pk=project_id).first()
     if project is None:
         raise api_error("NOT_FOUND")

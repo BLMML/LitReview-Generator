@@ -734,6 +734,103 @@
             }
           }
         }
+      },
+      "delete": {
+        "operationId": "deleteProject",
+        "summary": "逻辑删除整个项目，隐藏全部下属资源",
+        "tags": [
+          "projects"
+        ],
+        "parameters": [
+          {
+            "name": "project_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-CSRFToken",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/ProjectDeletion"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "request_id": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "request_id"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectDelete"
+              }
+            }
+          }
+        }
       }
     },
     "/projects/{project_id}/papers": {
@@ -1250,6 +1347,103 @@
             "application/json": {
               "schema": {
                 "$ref": "#/components/schemas/PaperPatch"
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deletePaper",
+        "summary": "删除论文（移出当前账本，保留历史证据）",
+        "tags": [
+          "papers"
+        ],
+        "parameters": [
+          {
+            "name": "paper_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "X-CSRFToken",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "成功",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "data": {
+                      "$ref": "#/components/schemas/PaperDeletion"
+                    },
+                    "meta": {
+                      "type": "object",
+                      "additionalProperties": false,
+                      "properties": {
+                        "request_id": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "request_id"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "data",
+                    "meta"
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "$ref": "#/components/responses/Error"
+          },
+          "401": {
+            "$ref": "#/components/responses/Error"
+          },
+          "403": {
+            "$ref": "#/components/responses/Error"
+          },
+          "404": {
+            "$ref": "#/components/responses/Error"
+          },
+          "409": {
+            "$ref": "#/components/responses/Error"
+          },
+          "413": {
+            "$ref": "#/components/responses/Error"
+          },
+          "422": {
+            "$ref": "#/components/responses/Error"
+          },
+          "429": {
+            "$ref": "#/components/responses/Error"
+          },
+          "503": {
+            "$ref": "#/components/responses/Error"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PaperDelete"
               }
             }
           }
@@ -5287,6 +5481,11 @@
             "type": "string",
             "enum": [
               "background",
+              "significance",
+              "approach",
+              "theoretical_basis",
+              "research_status",
+              "achievements",
               "directions",
               "representative_work",
               "disagreements",
@@ -5342,9 +5541,9 @@
             "items": {
               "$ref": "#/components/schemas/Section"
             },
-            "maxItems": 5,
+            "maxItems": 6,
             "minItems": 5,
-            "description": "固定五节顺序；全稿最多100个block，block_id唯一。跨项约束由后端校验。"
+            "description": "固定新研究框架六个内容槽；旧五节仅供历史兼容。"
           },
           "source": {
             "type": "string",
@@ -6135,9 +6334,9 @@
             "items": {
               "$ref": "#/components/schemas/Section"
             },
-            "maxItems": 5,
+            "maxItems": 6,
             "minItems": 5,
-            "description": "固定五节顺序；全稿最多100个block，block_id唯一。跨项约束由后端校验。"
+            "description": "固定新研究框架六个内容槽；旧五节仅供历史兼容。"
           }
         },
         "required": [
@@ -6252,6 +6451,82 @@
             }
           }
         }
+      },
+      "PaperDelete": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "expected_version"
+        ]
+      },
+      "PaperDeletion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "paper_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "deleted": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          },
+          "corpus_revision": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "paper_id",
+          "deleted",
+          "corpus_revision"
+        ]
+      },
+      "ProjectDelete": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "expected_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expected_corpus_revision": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "expected_version",
+          "expected_corpus_revision"
+        ]
+      },
+      "ProjectDeletion": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "deleted": {
+            "type": "boolean",
+            "enum": [
+              true
+            ]
+          }
+        },
+        "required": [
+          "project_id",
+          "deleted"
+        ]
       }
     },
     "responses": {

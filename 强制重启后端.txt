@@ -1,0 +1,21 @@
+强制重启 Django 后端（PowerShell）
+
+使用方法：打开 PowerShell，将下面整段复制进去并执行。
+此指令强制停止当前监听 8000 端口的进程，再启动 Django 后端。
+强制停止会中断正在处理的后端请求。
+
+cd "D:\LitReview Generator\backend"
+
+Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction SilentlyContinue |
+    Select-Object -ExpandProperty OwningProcess -Unique |
+    ForEach-Object { Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue }
+
+Remove-Item Env:LLM_MAX_INPUT_TOKENS -ErrorAction SilentlyContinue
+..\.venv\Scripts\python.exe manage.py runserver 127.0.0.1:8000 --noreload
+
+看到 Starting development server at http://127.0.0.1:8000/ 表示后端启动成功。
+启动后保留这个终端运行。需要停止时按 Ctrl+C。
+
+新进程会读取项目 .env 中的 LLM_MAX_INPUT_TOKENS；当前配置为 384000（约三万字单篇及双篇比较）。
+上述指令针对 Django Web 服务，不包含 Celery worker 或 beat。
+前端入口：http://127.0.0.1:5173

@@ -1,0 +1,12 @@
+:root {
+  --paper: #fafaf8;
+  --pencil: #4a4a4a;
+  --ink: #1a1a1a;
+  --kraft: #c4a77d;
+  --kraft-light: #eae3d5;
+  --rule: #cdc6b9;
+  --danger: #8a2c23;
+  --good: #36523a;
+  --focus: #896219;
+  --mono: 'Cascadia Code', Consolas, 'Courier New', monospace;
+}

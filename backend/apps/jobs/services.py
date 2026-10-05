@@ -354,7 +354,12 @@ def cancel_job(actor: ActorContext, job_id: uuid.UUID) -> Job:
     """
     now = timezone.now()
     with transaction.atomic():
-        job = Job.objects.select_for_update().filter(pk=job_id, project__owner=actor.user).first()
+        # 鉴权 JOIN 只读 Project；取消只锁 Job，避免与业务发布的 Project → Job 锁序交叉。
+        job = (
+            Job.objects.select_for_update(of=("self",))
+            .filter(pk=job_id, project__owner=actor.user, project__deleted_at__isnull=True)
+            .first()
+        )
         if job is None:
             raise api_error("NOT_FOUND")
 
@@ -369,6 +374,7 @@ def cancel_job(actor: ActorContext, job_id: uuid.UUID) -> Job:
             job.status = JOB_STATUS_CANCELLING
             job.cancel_requested_at = job.cancel_requested_at or now
         job.save(update_fields=["status", "cancel_requested_at", "finished_at", "updated_at"])
+        finalize_export_status(job, job.status)
         return job
 
 
@@ -399,11 +405,19 @@ def _finish(
         if finalize_resource is not None:
             finalize_resource(job)
 
+        finalize_export_status(job, status, error)
+
         job.status = status
         job.result = dict(result) if result is not None else job.result
         job.error = dict(error) if error is not None else None
         job.finished_at = now
-        job.save(update_fields=["status", "result", "error", "finished_at", "updated_at"])
+        progress = dict(job.progress or {})
+        total = progress.get("total")
+        if status == JOB_STATUS_SUCCEEDED and type(total) is int and total > 0:
+            # Completion is published with the resource, never before its
+            # transaction commits. Failed/cancelled jobs keep partial progress.
+            job.progress = {**progress, "completed": total}
+        job.save(update_fields=["status", "result", "error", "finished_at", "progress", "updated_at"])
         return job
 
 
@@ -453,6 +467,7 @@ def mark_cancelled(context: ExecutionContext, job: Job) -> Job:
         if locked.cancel_requested_at is None:
             raise api_error("INVALID_JOB_STATE", "没有取消请求")
         locked.status = JOB_STATUS_CANCELLED
+        finalize_export_status(locked, JOB_STATUS_CANCELLED)
         locked.finished_at = now
         locked.save(update_fields=["status", "finished_at", "updated_at"])
         return locked
@@ -465,7 +480,9 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
     resource_id 与 frozen_input 沿用；attempt 在 Project 锁内递增，旧 Job 历史不改写。
     """
     with transaction.atomic():
-        previous = Job.objects.filter(pk=job_id, project__owner=actor.user).first()
+        previous = Job.objects.filter(
+            pk=job_id, project__owner=actor.user, project__deleted_at__isnull=True
+        ).first()
         if previous is None:
             raise api_error("NOT_FOUND")
 
@@ -519,6 +536,7 @@ def retry_job(actor: ActorContext, job_id: uuid.UUID, idempotency: Any | None = 
             # 注意这里复制的是**账本**，不代表本次尝试已经成功——终态仍由执行结果决定。
             result=_inherited_result(previous),
         )
+        finalize_export_status(new_job, JOB_STATUS_QUEUED)
         result = AcceptedJob(
             job_id=new_job.id,
             resource_type=new_job.resource_type,
@@ -555,9 +573,7 @@ def _inherited_progress(previous: Job) -> dict[str, Any]:
         items = _ledger_of(candidate)
         if not items:
             continue
-        finished = sum(
-            1 for item in items if item.get("status") in ("imported", "duplicate")
-        )
+        finished = sum(1 for item in items if item.get("status") in ("imported", "duplicate"))
         progress = {**progress, "completed": finished, "total": len(items), "unit": "paper"}
         break
     return progress
@@ -598,6 +614,44 @@ def _check_retry_resource(job: Job) -> None:
         project = apps.get_model("projects", "Project").objects.get(pk=job.project_id)
         if run.corpus_revision != project.corpus_revision:
             raise api_error("STALE_RUN")
+
+    if job.kind == "export_docx":
+        from apps.reviews.snapshots import (
+            export_warnings,
+            require_acknowledged,
+            require_completed_report,
+            require_revision_integrity,
+        )
+
+        export = (
+            apps.get_model("reviews", "Export")
+            .objects.select_related("revision__review__project", "revision__run", "validation_report")
+            .filter(pk=job.resource_id, revision__review__project_id=job.project_id)
+            .first()
+        )
+        if export is None:
+            raise api_error("NOT_FOUND")
+        require_revision_integrity(export.revision, export.content_hash)
+        require_completed_report(export.revision, export.validation_report)
+        require_acknowledged(
+            export_warnings(export.revision, export.validation_report),
+            export.acknowledge_warnings,
+            frozen=export.warnings,
+        )
+
+
+def finalize_export_status(job: Job, status: str, error: Mapping | None = None) -> None:
+    """与 Job 同事务同步导出终态；调用方先锁 Job，再更新 Export。"""
+    if job.kind != "export_docx":
+        return
+    from django.apps import apps
+
+    target = {"failed": "failed", "cancelled": "cancelled", "queued": "pending"}.get(status)
+    if target is not None:
+        apps.get_model("reviews", "Export").objects.filter(
+            pk=job.resource_id,
+            revision__review__project_id=job.project_id,
+        ).exclude(status="ready").update(status=target, error=dict(error) if error else None)
 
 
 def active_jobs_for_reconcile(*, stale_before: datetime, limit: int = 100) -> list[Job]:

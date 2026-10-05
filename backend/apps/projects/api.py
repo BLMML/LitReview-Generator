@@ -1,7 +1,7 @@
-"""projects.api：项目列表 / 创建 / 详情 / PATCH 的 DTO 适配。
+"""projects.api：项目列表 / 创建 / 详情 / 修改 / 删除的 DTO 适配。
 
 字段以 docs/mvp/03 第 2.1 节与 contracts/openapi.json 的 Project /
-ProjectCreate / ProjectPatch 为准。HTTP 字段保持 snake_case。
+ProjectCreate / ProjectPatch / ProjectDelete 为准。HTTP 字段保持 snake_case。
 """
 
 from __future__ import annotations
@@ -26,15 +26,13 @@ from apps.projects.selectors import (
     get_owned_project,
     list_owned_projects,
 )
-from apps.projects.services import create_project, update_project
+from apps.projects.services import create_project, delete_project, update_project
 
 
 class ProjectCreateSerializer(StrictSerializer):
     """ProjectCreate 契约：title 1—120、research_question 5—2,000。"""
 
-    title = serializers.CharField(
-        min_length=1, max_length=settings.MVP_LIMITS["PROJECT_TITLE_MAX"]
-    )
+    title = serializers.CharField(min_length=1, max_length=settings.MVP_LIMITS["PROJECT_TITLE_MAX"])
     research_question = serializers.CharField(
         min_length=settings.MVP_LIMITS["RESEARCH_QUESTION_MIN"],
         max_length=settings.MVP_LIMITS["RESEARCH_QUESTION_MAX"],
@@ -62,9 +60,7 @@ class ProjectPatchSerializer(StrictSerializer):
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         if "title" not in attrs and "research_question" not in attrs:
-            raise serializers.ValidationError(
-                {"title": ["title 与 research_question 至少提供一项"]}
-            )
+            raise serializers.ValidationError({"title": ["title 与 research_question 至少提供一项"]})
         return attrs
 
 
@@ -89,6 +85,11 @@ class ProjectSerializer(serializers.Serializer):
     def get_active_job_id(self, obj: Any) -> str | None:
         value = getattr(obj, "active_job_id", None)
         return str(value) if value else None
+
+
+class ProjectDeleteSerializer(StrictSerializer):
+    expected_version = serializers.IntegerField(min_value=1)
+    expected_corpus_revision = serializers.IntegerField(min_value=1)
 
 
 def _dto(project_id: Any) -> dict[str, Any]:
@@ -117,21 +118,24 @@ def projects_collection(request: Any) -> Response:
     return success(_dto(project.pk), request=request, status_code=201)
 
 
-@api_view(["GET", "PATCH"])
+@api_view(["GET", "PATCH", "DELETE"])
 def project_detail(request: Any, project_id: Any) -> Response:
-    """GET /projects/{id} 与 PATCH /projects/{id}。"""
+    """GET / PATCH / DELETE /projects/{id}。"""
     actor = require_actor(request)
 
     if request.method == "GET":
         project = get_owned_project(actor, project_id)
         return success(ProjectSerializer(project).data, request=request)
 
+    if request.method == "DELETE":
+        serializer = ProjectDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return success(delete_project(actor, project_id, **serializer.validated_data), request=request)
+
     serializer = ProjectPatchSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     validated = serializer.validated_data
-    changes = {
-        key: validated[key] for key in ("title", "research_question") if key in validated
-    }
+    changes = {key: validated[key] for key in ("title", "research_question") if key in validated}
     update_project(actor, project_id, validated["expected_version"], changes)
     return success(_dto(project_id), request=request)
 

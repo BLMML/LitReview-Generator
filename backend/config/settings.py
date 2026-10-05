@@ -346,6 +346,48 @@ MVP_LIMITS = {
     "IDEMPOTENCY_RETENTION_DAYS": 7,
 }
 
+# ── 解析与证据（M06，docs/mvp/04 第 6.2 节）────────────────────
+# 解析产物的缓存身份：parser_revision 参与唯一约束，解析行为改变时必须提升它。
+PARSER_REVISION = "parse-v2"
+# 本地切片器：每片 600—1,200 字符（`04` 第 6.2 节）。MVP 不据此伪造句级坐标。
+EVIDENCE_CHUNK_MIN_CHARS = 600
+EVIDENCE_CHUNK_MAX_CHARS = 1200
+# 页面渲染倍率与图像上限（`04` 第 6.2 节：每次最多 2 张、每张不超过 5 MiB）
+PAGE_RENDER_SCALE = 2.0
+PAGE_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+PAGE_IMAGES_PER_CALL = 1
+# 归一化规则版本：切片与文本归一化方式改变时提升，便于追溯
+NORMALIZATION_REVISION = "norm-v1"
+
+# ── 检索索引（M08，docs/mvp/01 第 4.5 节）─────────────────────
+# M09 起索引作为 Run 专属产物落盘（AnalysisRun.index_asset + index_manifest），
+# 但格式是**纯 JSON**：只保存词表、IDF 与稀疏计数，加载后由本进程重建矩阵。
+# 因此既满足"Run 专属索引文件"的契约，也不存在反序列化执行代码的面——
+# 更不会接收用户上传的 pickle / joblib。
+RETRIEVAL_INDEX_MAX_FEATURES = 20000
+RETRIEVAL_INDEX_MIN_DF = 1
+RETRIEVAL_INDEX_NGRAM_MAX = 2
+# 查询扩展条数上限（模型 Schema 上限为 5，配置不得超过它）
+RETRIEVAL_MAX_QUERIES = 5
+# 重排候选送模上限（模型 Schema 上限为 50）
+RETRIEVAL_RERANK_MAX_CANDIDATES = 50
+
+# ── 索引产物与主题 / 争议（M09，docs/mvp/04 第 3 节）──────────
+INDEX_ARTIFACT_VERSION = "index-json-v1"
+INDEX_ARTIFACT_MAX_BYTES = 32 * 1024 * 1024
+# 模型 Schema 上限分别是 20 与 50；这里的配置不得超过它们
+TOPICS_MAX = 20
+DISPUTES_MAX = 50
+# 每批最多八篇；完整项目最多三十篇，超过批大小时分批归纳并覆盖跨批比较。
+ANALYSIS_PAPERS_PER_BATCH = 8
+# 历史配置名保留兼容；这是单次比较请求的篇数上限，不截断主题成员。
+DISPUTES_MAX_PAPERS_PER_TOPIC = 8
+
+# ── 综述生成（M10，docs/mvp/04 第 5.1 节）─────────────────────
+# 每节 block 数上限。全稿上限由 reviews.schemas.MAX_BLOCKS_TOTAL 固定为 100，
+# 这里限制单节，避免某一节吃满整篇配额。
+REVIEW_MAX_BLOCKS_PER_SECTION = 20
+
 OUTPUT_LANGUAGE_DEFAULT = "zh-CN"
 OUTPUT_LANGUAGES_ALLOWED = ("zh-CN",)
 REVIEW_STYLE_DEFAULT = "standard"
@@ -391,7 +433,8 @@ DEEPSEEK_THINKING_MODE = env_str("DEEPSEEK_THINKING_MODE", "disabled")
 
 LLM_REQUEST_TIMEOUT_SECONDS = env_int("LLM_REQUEST_TIMEOUT_SECONDS", 120, minimum=1)
 LLM_MAX_ATTEMPTS = env_int("LLM_MAX_ATTEMPTS", 3, minimum=1, maximum=3)
-LLM_MAX_INPUT_TOKENS = env_int("LLM_MAX_INPUT_TOKENS", 24000, minimum=1)
+# UTF-8 字节上界涵盖全文、证据 ID、Schema 和提示词；支持约三万字单篇及双篇比较。
+LLM_MAX_INPUT_TOKENS = env_int("LLM_MAX_INPUT_TOKENS", 384000, minimum=1)
 LLM_MAX_OUTPUT_TOKENS = env_int("LLM_MAX_OUTPUT_TOKENS", 4096, minimum=1)
 LLM_MAX_CONCURRENCY = env_int("LLM_MAX_CONCURRENCY", 2, minimum=1)
 

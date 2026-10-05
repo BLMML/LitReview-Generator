@@ -14,7 +14,7 @@ from django.db.models import Q
 
 from apps.common.models import CreatedAtModel, TimeStampedModel
 
-# 五类固定章节，顺序固定
+# 历史五节结构用于兼容旧版本；新稿固定框架见 reviews.structure。
 SECTION_KEYS = (
     "background",
     "directions",
@@ -70,9 +70,7 @@ class Review(CreatedAtModel):
     title = models.CharField(max_length=settings.MVP_LIMITS["REVIEW_TITLE_MAX"])
     # 冻结生成时的 analysis_revision
     analysis_revision = models.PositiveBigIntegerField()
-    target_chars = models.SmallIntegerField(
-        default=settings.MVP_LIMITS["REVIEW_TARGET_CHARS_DEFAULT"]
-    )
+    target_chars = models.SmallIntegerField(default=settings.MVP_LIMITS["REVIEW_TARGET_CHARS_DEFAULT"])
     style = models.CharField(max_length=32, default=settings.REVIEW_STYLE_DEFAULT)
     # 创建即冻结生成参数；不随环境配置变更
     config_snapshot = models.JSONField(default=dict)
@@ -116,7 +114,7 @@ class ReviewRevision(CreatedAtModel):
     analysis_revision = models.PositiveBigIntegerField()
     corpus_revision = models.PositiveBigIntegerField()
 
-    # 五节正文；每节 {section_key,title,blocks}
+    # 固定内容槽；每槽 {section_key,title,blocks}，历史五节或新稿六槽。
     sections = models.JSONField(default=list)
     config_snapshot = models.JSONField(default=dict)
 
@@ -157,17 +155,11 @@ class ReviewRevision(CreatedAtModel):
                 condition=Q(source_job__isnull=False),
                 name="revision_source_job_unique",
             ),
-            models.CheckConstraint(
-                condition=Q(revision_number__gte=1), name="revision_number_positive"
-            ),
-            models.CheckConstraint(
-                condition=Q(source__in=REVISION_SOURCES), name="revision_source_known"
-            ),
+            models.CheckConstraint(condition=Q(revision_number__gte=1), name="revision_number_positive"),
+            models.CheckConstraint(condition=Q(source__in=REVISION_SOURCES), name="revision_source_known"),
         ]
         indexes = [
-            models.Index(
-                fields=["review", "-revision_number"], name="revision_review_number_idx"
-            ),
+            models.Index(fields=["review", "-revision_number"], name="revision_review_number_idx"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用
@@ -204,9 +196,7 @@ class ValidationReport(TimeStampedModel):
             ),
         ]
         indexes = [
-            models.Index(
-                fields=["revision", "-created_at", "-id"], name="validation_rev_created_idx"
-            ),
+            models.Index(fields=["revision", "-created_at", "-id"], name="validation_rev_created_idx"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用
@@ -250,14 +240,10 @@ class Export(TimeStampedModel):
     class Meta:
         db_table = "reviews_export"
         constraints = [
-            models.CheckConstraint(
-                condition=Q(status__in=EXPORT_STATUSES), name="export_status_known"
-            ),
+            models.CheckConstraint(condition=Q(status__in=EXPORT_STATUSES), name="export_status_known"),
         ]
         indexes = [
-            models.Index(
-                fields=["revision", "-created_at", "-id"], name="export_revision_created_idx"
-            ),
+            models.Index(fields=["revision", "-created_at", "-id"], name="export_revision_created_idx"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用

@@ -243,6 +243,10 @@ def validate_payload(request: ModelTaskRequest, payload: Mapping[str, Any]) -> N
             raise api_error("MODEL_OUTPUT_INVALID", "争议两侧必须是不同论文")
 
     visit(payload)
+    if request.task_type == TASK_REVIEW_SECTION:
+        maximum = request.payload.get("max_blocks", 100)
+        if len(payload["blocks"]) > maximum:
+            raise api_error("MODEL_OUTPUT_INVALID", "章节 block 数超过请求的冻结上限")
     if request.task_type == TASK_RERANK:
         ids = [r["evidence_id"] for r in payload["results"]]
         if len(ids) != len(set(ids)):

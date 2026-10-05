@@ -57,18 +57,35 @@ class RetrievalCreateSerializer(StrictSerializer):
         return attrs
 
 
+class RetrievalHitSerializer(serializers.Serializer):
+    """RetrievalHit：只允许 evidence_id / rank / score / reason。
+
+    `paper_id` 与 `page_number` 便于前端跳转，但**不在冻结契约里**；
+    需要它们时应先扩展 `docs/mvp` 契约与前端类型，而不是让接口先多返回字段。
+    """
+
+    evidence_id = serializers.UUIDField()
+    rank = serializers.IntegerField()
+    score = serializers.FloatField()
+    reason = serializers.CharField()
+
+
 class RetrievalSerializer(serializers.Serializer):
+    """Retrieval DTO（`03` 第 2.4 节）。
+
+    冻结契约**不含** `analysis_revision` / `expanded_queries` / `updated_at`；
+    扩展查询是内部追溯信息，通过数据库而不是 HTTP 暴露。
+    结果项由 `RetrievalHitSerializer` 投影，不直接透传内部 `results` 结构。
+    """
+
     id = serializers.UUIDField()
     run_id = serializers.UUIDField(source="run.id")
+    job_id = serializers.SerializerMethodField()
     query = serializers.CharField()
-    analysis_revision = serializers.IntegerField()
     candidate_limit = serializers.IntegerField()
     top_k = serializers.IntegerField()
-    expanded_queries = serializers.JSONField()
-    results = serializers.JSONField()
+    results = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField()
-    updated_at = serializers.DateTimeField()
-    job_id = serializers.SerializerMethodField()
 
     def get_job_id(self, obj: RetrievalResult) -> str | None:
         from apps.jobs.models import Job
@@ -79,6 +96,12 @@ class RetrievalSerializer(serializers.Serializer):
             .first()
         )
         return str(job.id) if job else None
+
+    def get_results(self, obj: RetrievalResult) -> Any:
+        if obj.results is None:
+            # 执行完成前为 null：前端据此区分"还没跑"与"跑完但无结果"
+            return None
+        return RetrievalHitSerializer(obj.results, many=True).data
 
 
 @api_view(["POST"])
@@ -97,12 +120,20 @@ def run_retrievals_create(request: Any, run_id: Any) -> Response:
 
 @api_view(["GET"])
 def run_retrievals_list(request: Any, run_id: Any) -> Response:
-    """GET /runs/{run_id}/retrievals：用于恢复历史查询。"""
+    """GET /runs/{run_id}/retrievals：用于恢复历史查询。
+
+    先校验 Run 的存在与归属：他人的 Run 必须 404，不能是「200 + 空列表」——
+    后者会让"这个 Run 不存在/不属于我"与"这个 Run 还没检索过"无法区分
+    （与 M05 复核中 `project_papers` 的同类问题一致）。
+    """
     actor = require_actor(request)
     reject_unknown_query_params(request, {"page", "page_size"})
-    queryset = RetrievalResult.objects.select_related("run", "run__project").filter(
-        run_id=run_id, run__project__owner=actor.user
-    )
+    if not AnalysisRun.objects.filter(
+        pk=run_id, project__owner=actor.user, project__deleted_at__isnull=True
+    ).exists():
+        raise api_error("NOT_FOUND")
+
+    queryset = RetrievalResult.objects.select_related("run", "run__project").filter(run_id=run_id)
     paginator = EnvelopePagination()
     page = paginator.paginate_queryset(queryset.order_by("-created_at", "-id"), request)
     return paginator.get_paginated_response(RetrievalSerializer(page, many=True).data)
@@ -114,7 +145,7 @@ def retrieval_detail(request: Any, retrieval_id: Any) -> Response:
     actor = require_actor(request)
     retrieval = (
         RetrievalResult.objects.select_related("run", "run__project")
-        .filter(pk=retrieval_id, run__project__owner=actor.user)
+        .filter(pk=retrieval_id, run__project__owner=actor.user, run__project__deleted_at__isnull=True)
         .first()
     )
     if retrieval is None:
@@ -122,7 +153,19 @@ def retrieval_detail(request: Any, retrieval_id: Any) -> Response:
     return success(RetrievalSerializer(retrieval).data, request=request)
 
 
+def _retrievals_endpoint(request: Any, run_id: Any) -> Response:
+    """`GET`/`POST` 共用一个路径（`03` 第 2.4 节）。
+
+    两者必须显式合并：只注册其中一个会让另一个方法落进 405 兜底分支。
+    此前这里只挂了 create 视图，`GET /runs/{id}/retrievals` 从来不是 404 而是 405，
+    前端"刷新后恢复检索历史"的路径实际不可用。
+    """
+    if request.method == "POST":
+        return run_retrievals_create(request, run_id)
+    return run_retrievals_list(request, run_id)
+
+
 urlpatterns = [
-    path("runs/<uuid:run_id>/retrievals", run_retrievals_create, name="run-retrieval-create"),
+    path("runs/<uuid:run_id>/retrievals", _retrievals_endpoint, name="run-retrievals"),
     path("retrievals/<uuid:retrieval_id>", retrieval_detail, name="retrieval-detail"),
 ]

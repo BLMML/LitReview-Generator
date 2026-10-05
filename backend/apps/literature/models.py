@@ -49,6 +49,8 @@ class Paper(TimeStampedModel):
     source_url = models.TextField(null=True, blank=True)
 
     included = models.BooleanField(default=True)
+    # 从当前账本移除，保留历史 Run、证据和原文关联。
+    deleted_at = models.DateTimeField(null=True, blank=True)
     # metadata 或 included 实际变化时递增
     version = models.PositiveBigIntegerField(default=1)
 
@@ -74,6 +76,10 @@ class Paper(TimeStampedModel):
                 condition=Q(version__gte=1), name="paper_version_positive"
             ),
             models.CheckConstraint(
+                condition=Q(deleted_at__isnull=True) | Q(included=False),
+                name="paper_deleted_not_included",
+            ),
+            models.CheckConstraint(
                 condition=Q(source__in=PAPER_SOURCES), name="paper_source_known"
             ),
             models.CheckConstraint(
@@ -89,6 +95,7 @@ class Paper(TimeStampedModel):
         indexes = [
             models.Index(fields=["project", "-created_at", "-id"], name="paper_project_created_idx"),
             models.Index(fields=["project", "included"], name="paper_project_included_idx"),
+            models.Index(fields=["project", "deleted_at"], name="paper_project_deleted_idx"),
         ]
 
     def __str__(self) -> str:  # pragma: no cover - 仅调试用

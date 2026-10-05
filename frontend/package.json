@@ -1,0 +1,40 @@
+{
+  "name": "litreview-workbench",
+  "version": "0.12.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "vue-tsc --noEmit && vite build",
+    "typecheck": "vue-tsc --noEmit",
+    "test": "vitest run",
+    "test:e2e": "playwright test",
+    "contracts": "node scripts/contracts.mjs",
+    "format": "prettier --write src tests scripts *.ts *.json index.html README.md",
+    "format:check": "prettier --check src tests scripts *.ts *.json index.html README.md"
+  },
+  "dependencies": {
+    "pdfjs-dist": "6.2.108",
+    "pinia": "^3.0.3",
+    "vue": "^3.5.22",
+    "vue-router": "^4.6.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0",
+    "@types/node": "^24.7.0",
+    "@vitejs/plugin-vue": "^6.0.1",
+    "@vue/test-utils": "2.4.6",
+    "jsdom": "26.1.0",
+    "prettier": "3.6.2",
+    "typescript": "^5.9.3",
+    "vite": "^7.1.9",
+    "vitest": "4.1.11",
+    "vue-tsc": "^3.1.0"
+  },
+  "overrides": {
+    "js-beautify": "1.15.4"
+  },
+  "engines": {
+    "node": "^22.13.0 || >=24.0.0"
+  }
+}

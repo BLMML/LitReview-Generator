@@ -32,6 +32,8 @@ class Project(TimeStampedModel):
     version = models.PositiveBigIntegerField(default=1)
     # 研究问题、纳入集合或文献元数据变化时递增；同文件重复上传不递增
     corpus_revision = models.PositiveBigIntegerField(default=1)
+    # 逻辑删除隐藏整个项目，保留私有文件、不可变历史与费用账本。
+    deleted_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         db_table = "projects_project"

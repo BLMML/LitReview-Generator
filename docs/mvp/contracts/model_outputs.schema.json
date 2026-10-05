@@ -368,6 +368,11 @@
           "type": "string",
           "enum": [
             "background",
+            "significance",
+            "approach",
+            "theoretical_basis",
+            "research_status",
+            "achievements",
             "directions",
             "representative_work",
             "disagreements",

@@ -4,12 +4,13 @@
 - 导出请求指向确切 revision 和报告；缺少匹配的报告时拒绝；
 - 历史列表的 revision_id 过滤值必须属于当前 Review，否则 404。
 
-**骨架状态**：读接口已实现；生成 / 核验 / 导出调用尚未实现的服务。
+生成、读取、编辑、指定版本核验与私有 Word 导出已实现。
 """
 
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import quote
 
 from django.conf import settings
 from django.http import FileResponse
@@ -29,6 +30,7 @@ from apps.common.http import (
 )
 from apps.common.idempotency import parse_idempotency_key
 from apps.common.storage import open_asset
+from apps.projects.selectors import get_owned_project
 from apps.reviews.models import Export, Review, ReviewRevision, ValidationReport
 from apps.reviews.services import (
     create_export,
@@ -48,15 +50,13 @@ class ReviewCreateSerializer(StrictSerializer):
     target_chars = serializers.IntegerField(
         min_value=settings.MVP_LIMITS["REVIEW_TARGET_CHARS_MIN"],
         max_value=settings.MVP_LIMITS["REVIEW_TARGET_CHARS_MAX"],
-        default=settings.MVP_LIMITS["REVIEW_TARGET_CHARS_DEFAULT"],
+        required=False,
     )
-    style = serializers.ChoiceField(
-        choices=list(settings.REVIEW_STYLES_ALLOWED), default=settings.REVIEW_STYLE_DEFAULT
-    )
+    style = serializers.ChoiceField(choices=list(settings.REVIEW_STYLES_ALLOWED), required=False)
 
 
 class RevisionCreateSerializer(StrictSerializer):
-    """全量五节正文；结构校验由 reviews.schemas 统一执行。"""
+    """全量固定框架正文；新稿同时校验原文和出处，历史结构兼容保留。"""
 
     base_revision_number = serializers.IntegerField(min_value=1)
     sections = serializers.ListField(child=serializers.DictField(), allow_empty=False)
@@ -73,15 +73,20 @@ class ExportCreateSerializer(StrictSerializer):
 
 
 class ReviewSerializer(serializers.Serializer):
+    """Review DTO（`03` 第 2.5 节）。
+
+    契约字段名是 `generation_job_id`；`analysis_revision` 属于内部记账，不出现在响应里
+    （它通过 `latest_revision.analysis_revision` 对外可见）。
+    """
+
     id = serializers.UUIDField()
     project_id = serializers.UUIDField(source="project.id")
     run_id = serializers.UUIDField(source="run.id")
     title = serializers.CharField()
-    analysis_revision = serializers.IntegerField()
     target_chars = serializers.IntegerField()
     style = serializers.CharField()
+    generation_job_id = serializers.SerializerMethodField()
     latest_revision = serializers.SerializerMethodField()
-    job_id = serializers.SerializerMethodField()
     created_at = serializers.DateTimeField()
 
     def get_latest_revision(self, obj: Review) -> Any:
@@ -89,36 +94,37 @@ class ReviewSerializer(serializers.Serializer):
         revision = obj.revisions.order_by("-revision_number").first()
         return ReviewRevisionSerializer(revision).data if revision else None
 
-    def get_job_id(self, obj: Review) -> str | None:
+    def get_generation_job_id(self, obj: Review) -> str | None:
         from apps.jobs.models import Job
 
-        job = (
-            Job.objects.filter(resource_type="review", resource_id=obj.id)
-            .order_by("-attempt")
-            .first()
-        )
+        job = Job.objects.filter(resource_type="review", resource_id=obj.id).order_by("-attempt").first()
         return str(job.id) if job else None
 
 
 class ReviewRevisionSerializer(serializers.Serializer):
+    """ReviewRevision DTO（`03` 第 2.5 节）。
+
+    冻结契约只允许这些字段：`corpus_revision`、`base_revision_number`、`content_hash`
+    是内部产物，由服务端用于完整性检查，不出现在响应中。
+    `is_stale` 是计算字段：正文冻结的 analysis_revision 落后于当前 Run 即为过时。
+    """
+
     id = serializers.UUIDField()
     review_id = serializers.UUIDField(source="review.id")
     run_id = serializers.UUIDField(source="run.id")
     revision_number = serializers.IntegerField()
     analysis_revision = serializers.IntegerField()
-    corpus_revision = serializers.IntegerField()
     sections = serializers.JSONField()
     source = serializers.CharField()
+    is_stale = serializers.SerializerMethodField()
     created_by = serializers.SerializerMethodField()
-    base_revision_number = serializers.SerializerMethodField()
-    content_hash = serializers.CharField()
     created_at = serializers.DateTimeField()
 
     def get_created_by(self, obj: ReviewRevision) -> str:
         return str(obj.created_by_id)
 
-    def get_base_revision_number(self, obj: ReviewRevision) -> int | None:
-        return obj.base_revision.revision_number if obj.base_revision_id else None
+    def get_is_stale(self, obj: ReviewRevision) -> bool:
+        return int(obj.analysis_revision) != int(obj.run.analysis_revision)
 
 
 class ValidationSerializer(serializers.Serializer):
@@ -169,18 +175,14 @@ class ExportSerializer(serializers.Serializer):
     def get_job_id(self, obj: Export) -> str | None:
         from apps.jobs.models import Job
 
-        job = (
-            Job.objects.filter(resource_type="export", resource_id=obj.id)
-            .order_by("-attempt")
-            .first()
-        )
+        job = Job.objects.filter(resource_type="export", resource_id=obj.id).order_by("-attempt").first()
         return str(job.id) if job else None
 
 
 def _owned_review(actor: Any, review_id: Any) -> Review:
     review = (
         Review.objects.select_related("project", "run")
-        .filter(pk=review_id, project__owner=actor.user)
+        .filter(pk=review_id, project__owner=actor.user, project__deleted_at__isnull=True)
         .first()
     )
     if review is None:
@@ -210,8 +212,9 @@ def project_reviews(request: Any, project_id: Any) -> Response:
     """GET /projects/{project_id}/reviews。"""
     actor = require_actor(request)
     reject_unknown_query_params(request, {"page", "page_size"})
+    get_owned_project(actor, project_id)
     queryset = Review.objects.select_related("project", "run").filter(
-        project_id=project_id, project__owner=actor.user
+        project_id=project_id, project__owner=actor.user, project__deleted_at__isnull=True
     )
     return _paginate(request, queryset.order_by("-created_at", "-id"), ReviewSerializer)
 
@@ -232,9 +235,7 @@ def review_revisions(request: Any, review_id: Any) -> Response:
     if request.method == "GET":
         reject_unknown_query_params(request, {"page", "page_size"})
         queryset = ReviewRevision.objects.filter(review=review)
-        return _paginate(
-            request, queryset.order_by("-revision_number"), ReviewRevisionSerializer
-        )
+        return _paginate(request, queryset.order_by("-revision_number"), ReviewRevisionSerializer)
 
     serializer = RevisionCreateSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
@@ -267,7 +268,7 @@ def review_validations(request: Any, review_id: Any) -> Response:
     if request.method == "GET":
         reject_unknown_query_params(request, {"page", "page_size", "revision_id"})
         queryset = ValidationReport.objects.filter(revision__review=review)
-        revision_id = request.query_params.get("revision_id")
+        revision_id = _revision_filter(request)
         if revision_id:
             # 过滤值必须属于当前 Review，否则 404
             if not ReviewRevision.objects.filter(pk=revision_id, review=review).exists():
@@ -290,7 +291,11 @@ def validation_detail(request: Any, validation_id: Any) -> Response:
     actor = require_actor(request)
     validation = (
         ValidationReport.objects.select_related("revision", "revision__review")
-        .filter(pk=validation_id, revision__review__project__owner=actor.user)
+        .filter(
+            pk=validation_id,
+            revision__review__project__owner=actor.user,
+            revision__review__project__deleted_at__isnull=True,
+        )
         .first()
     )
     if validation is None:
@@ -307,7 +312,7 @@ def review_exports(request: Any, review_id: Any) -> Response:
     if request.method == "GET":
         reject_unknown_query_params(request, {"page", "page_size", "revision_id"})
         queryset = Export.objects.filter(revision__review=review)
-        revision_id = request.query_params.get("revision_id")
+        revision_id = _revision_filter(request)
         if revision_id:
             if not ReviewRevision.objects.filter(pk=revision_id, review=review).exists():
                 raise api_error("NOT_FOUND")
@@ -332,12 +337,23 @@ def export_detail(request: Any, export_id: Any) -> Response:
     actor = require_actor(request)
     export = (
         Export.objects.select_related("revision", "revision__review", "validation_report")
-        .filter(pk=export_id, revision__review__project__owner=actor.user)
+        .filter(
+            pk=export_id,
+            revision__review__project__owner=actor.user,
+            revision__review__project__deleted_at__isnull=True,
+        )
         .first()
     )
     if export is None:
         raise api_error("NOT_FOUND")
     return success(ExportSerializer(export).data, request=request)
+
+
+def _revision_filter(request: Any) -> Any:
+    raw = request.query_params.get("revision_id")
+    if raw is None:
+        return None
+    return serializers.UUIDField().run_validation(raw)
 
 
 @api_view(["GET"])
@@ -346,7 +362,11 @@ def export_file(request: Any, export_id: Any) -> Response | FileResponse:
     actor = require_actor(request)
     export = (
         Export.objects.select_related("revision", "revision__review", "file_asset")
-        .filter(pk=export_id, revision__review__project__owner=actor.user)
+        .filter(
+            pk=export_id,
+            revision__review__project__owner=actor.user,
+            revision__review__project__deleted_at__isnull=True,
+        )
         .first()
     )
     if export is None:
@@ -355,11 +375,14 @@ def export_file(request: Any, export_id: Any) -> Response | FileResponse:
         raise api_error("RESULT_NOT_READY")
 
     asset = export.file_asset
+    if asset.project_id != export.revision.review.project_id or asset.purpose != "export_docx":
+        raise api_error("NOT_FOUND")
     handle = open_asset(asset)
     response = FileResponse(handle, content_type=asset.media_type or DOCX_MEDIA_TYPE)
     response["Content-Length"] = str(asset.size_bytes)
     # attachment：Word 草稿按下载处理；文件名 UTF-8 编码，不泄漏存储路径
-    response["Content-Disposition"] = f"attachment; filename*=UTF-8''{asset.original_filename}"
+    filename = quote(asset.original_filename, safe="")
+    response["Content-Disposition"] = f"attachment; filename*=UTF-8''{filename}"
     return response
 
 

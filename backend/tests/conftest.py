@@ -172,7 +172,143 @@ def upload_pdf_file() -> Any:
     return make_pdf_file
 
 
+# ── 含文本层的 PDF 夹具（M06 解析与证据用）────────────────────
+def make_text_pdf_bytes(pages: list[str]) -> bytes:
+    """生成**含文本层**的真 PDF，每项是一页的正文（`\\n` 分行）。
+
+    M06 的解析与证据测试必须面对真实文本层：`make_pdf_bytes` 造的是空白页版 PDF，
+    提取出来是空串，无法验证分页、切片与原文匹配。这里用 pypdf 手工写内容流，
+    不引入 reportlab 之类只为测试存在的依赖。
+    """
+    import io
+
+    from pypdf import PdfWriter
+    from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
+
+    writer = PdfWriter()
+    for body in pages:
+        page = writer.add_blank_page(width=595, height=842)  # A4 点
+        font = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Font"),
+                NameObject("/Subtype"): NameObject("/Type1"),
+                NameObject("/BaseFont"): NameObject("/Helvetica"),
+                NameObject("/Encoding"): NameObject("/WinAnsiEncoding"),
+            }
+        )
+        font_ref = writer._add_object(font)  # noqa: SLF001 - 仅为构造测试 PDF
+        page[NameObject("/Resources")] = DictionaryObject(
+            {NameObject("/Font"): DictionaryObject({NameObject("/F1"): font_ref})}
+        )
+        lines = body.split("\n") if body else [""]
+        content = ["BT", "/F1 12 Tf", "50 780 Td", "16 TL"]
+        for line in lines:
+            escaped = line.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
+            content.append(f"({escaped}) Tj T*")
+        content.append("ET")
+        stream = DecodedStreamObject()
+        stream.set_data("\n".join(content).encode("latin-1", errors="replace"))
+        page[NameObject("/Contents")] = writer._add_object(stream)  # noqa: SLF001
+
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def make_text_pdf_file(pages: list[str], *, name: str = "text.pdf") -> Any:
+    """包成上传用的 SimpleUploadedFile。"""
+    from django.core.files.uploadedfile import SimpleUploadedFile
+
+    return SimpleUploadedFile(name, make_text_pdf_bytes(pages), content_type="application/pdf")
+
+
 @pytest.fixture(autouse=True)
 def _no_arxiv_rate_limit(settings: pytest.FixtureRequest) -> None:
     """测试里不真的按 arXiv 频率下限等待；限流逻辑本身单测另行覆盖。"""
     settings.MVP_LIMITS = {**settings.MVP_LIMITS, "ARXIV_MIN_INTERVAL_SECONDS": 0}
+
+
+# ── 已就绪的 Run（M08 检索与 M10 生成的前置）──────────────────
+ANALYSIS_PAGES = [
+    "Abstract\nSelf-attention improves sequence modelling on small corpora.",
+    "Introduction\nRecurrent baselines are compared with attention models.",
+    "3. Method\nWe replace the recurrent layer with a multi-head attention block.",
+    "4. Results\nAttention improves accuracy by two points on the benchmark.",
+    "5. Limitations\nThe evaluation covers a single language and dataset.",
+]
+
+
+def analysis_extract_payload(evidence_ids: list[str]) -> dict:
+    """结构合法的 PaperExtract 输出，供 M07/M08/M10 夹具共用。"""
+    single = {"value": "结论成立", "evidence_ids": [evidence_ids[0]]}
+    listed = [{"value": "方法要点", "evidence_ids": [evidence_ids[-1]]}]
+    return {
+        "research_question": single,
+        "research_object": {"value": None, "evidence_ids": []},
+        "summary": single,
+        "methods": listed,
+        "datasets": [],
+        "metrics": [],
+        "conclusions": listed,
+        "limitations": [],
+    }
+
+
+@pytest.fixture
+def ready_run(client_a, project_a, monkeypatch):
+    """一个 `ready` 的 Run，含两篇已解析并已抽取的论文。
+
+    M07 的 `execute_run` 在后续阶段（index / topics / disputes / finalize）未实现时
+    会把 Run 显式判成 failed；而检索与生成的前置是"Run 已 ready"。
+    该状态要等 M09 才由流水线自己产生，所以这里在建好真实产物后推进状态位——
+    **产物本身仍是真实跑出来的**，只有状态位是手工的。
+    """
+    import uuid as _uuid
+
+    from apps.analysis import services as analysis_services
+    from apps.analysis.models import RUN_READY, AnalysisRun
+
+    monkeypatch.setattr("apps.jobs.services.dispatch", lambda job: None)
+    for name in ("alpha", "beta"):
+        response = client_a.post(
+            f"/api/v1/projects/{project_a.id}/papers/upload",
+            {
+                "file": make_text_pdf_file(
+                    [f"{name} {page}" for page in ANALYSIS_PAGES], name=f"{name}.pdf"
+                )
+            },
+            format="multipart",
+            HTTP_IDEMPOTENCY_KEY=str(_uuid.uuid4()),
+        )
+        assert response.status_code == 201, response.json()
+
+    class _Result:
+        def __init__(self, payload):
+            self.payload = payload
+            self.call_id = "mock:paper_extract"
+
+    monkeypatch.setattr(
+        analysis_services,
+        "call_structured",
+        lambda context, request: _Result(
+            analysis_extract_payload(list(request.allowed_evidence_ids))
+        ),
+    )
+
+    accepted = client_a.post(
+        f"/api/v1/projects/{project_a.id}/runs",
+        {},
+        format="json",
+        HTTP_IDEMPOTENCY_KEY=str(_uuid.uuid4()),
+    ).json()["data"]
+
+    from apps.jobs.services import claim_execution
+
+    context = claim_execution(accepted["job_id"])
+    analysis_services.execute_run(context, context.run_id)
+
+    run = AnalysisRun.objects.get(pk=context.run_id)
+    run.status = RUN_READY
+    run.error = None
+    run.save(update_fields=["status", "error", "updated_at"])
+    return run

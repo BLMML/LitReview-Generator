@@ -3,6 +3,7 @@
 职责（docs/mvp/01 第 4.2 节）：
 - `upload_pdf(actor, project_id, uploaded_file, metadata, key) → Paper`
 - `update_paper(actor, paper_id, expected_version, changes) → Paper`
+- `delete_paper(actor, paper_id, expected_version) → PaperDeletion`
 - `import_arxiv(actor, project_id, arxiv_ids, key) → AcceptedJob`
 - `execute_import_arxiv(context, job_id) → ItemResults`
 
@@ -74,17 +75,19 @@ def _require_owned_project(actor: ActorContext, project_id: Any) -> Any:
     """越权与不存在统一 404，不泄露资源归属。"""
     from apps.projects.models import Project
 
-    project = Project.objects.filter(pk=project_id, owner=actor.user).first()
+    project = Project.objects.filter(pk=project_id, owner=actor.user, deleted_at__isnull=True).first()
     if project is None:
         raise api_error("NOT_FOUND")
     return project
 
 
 def _require_owned_paper(actor: ActorContext, paper_id: Any, *, lock: bool = False) -> Paper:
-    queryset = Paper.objects.select_for_update() if lock else Paper.objects
-    paper = queryset.select_related("project", "file_asset").filter(
-        pk=paper_id, project__owner=actor.user
-    ).first()
+    queryset = Paper.objects.select_for_update(of=("self",)) if lock else Paper.objects
+    paper = (
+        queryset.select_related("project", "file_asset")
+        .filter(pk=paper_id, project__owner=actor.user, project__deleted_at__isnull=True)
+        .first()
+    )
     if paper is None:
         raise api_error("NOT_FOUND")
     return paper
@@ -100,8 +103,8 @@ def _project_pk(project: Any) -> Any:
 
 
 def _paper_capacity_left(project: Any, *, pending_new: int = 0) -> int:
-    """项目还可新增多少篇（含已取消纳入的）。超限返回 0。"""
-    existing = Paper.objects.filter(project_id=_project_pk(project)).count()
+    """当前账本还可新增多少篇（含取消纳入，不含已删除）。超限返回 0。"""
+    existing = Paper.objects.filter(project_id=_project_pk(project), deleted_at__isnull=True).count()
     return max(0, int(_limits()["PAPERS_PER_PROJECT_MAX"]) - existing - pending_new)
 
 
@@ -110,9 +113,7 @@ def _clean_title(raw: Any, fallback: str) -> str:
         return fallback
     text = str(raw).replace("\x00", "").strip()
     if not text:
-        raise api_error(
-            "VALIDATION_ERROR", "title 不能为空", {"fields": {"title": ["不能为空"]}}
-        )
+        raise api_error("VALIDATION_ERROR", "title 不能为空", {"fields": {"title": ["不能为空"]}})
     max_length = int(_limits()["PAPER_TITLE_MAX"])
     if len(text) > max_length:
         raise api_error(
@@ -129,9 +130,7 @@ def _title_from_filename(filename: str) -> str:
 
 
 # ── 上传 ──────────────────────────────────────────────────────
-def _upload_claim(
-    actor: ActorContext, project_id: Any, key: Any, request_hash: str
-) -> ReplayResult | Claim:
+def _upload_claim(actor: ActorContext, project_id: Any, key: Any, request_hash: str) -> ReplayResult | Claim:
     if isinstance(key, Claim):
         return claim_or_replay(actor, key.method, key.canonical_path, key.key, key.request_hash)
     return claim_or_replay(
@@ -154,7 +153,7 @@ def upload_pdf(
     提交失败清理可确认无引用的暂存文件。
 
     相同项目同一 SHA256 重传返回既有 Paper（201 + X-Resource-Reused:true），
-    不递增语料版本、不改其 metadata/included。
+    未删除时不递增语料版本、不改其 metadata/included；已删除时新提交恢复原记录。
     """
     if uploaded_file is None:
         raise api_error("VALIDATION_ERROR", "缺少 file 字段", {"fields": {"file": ["必填"]}})
@@ -192,22 +191,25 @@ def upload_pdf(
             # 活跃任务期间不接受新的语料写入
             require_project_idle(locked)
 
-            existing = Paper.objects.select_related("file_asset").filter(
-                project=locked, file_sha256=staged.sha256
-            ).first()
-            if _paper_capacity_left(locked) <= 0 and existing is None:
+            existing = (
+                Paper.objects.select_related("file_asset")
+                .filter(project=locked, file_sha256=staged.sha256)
+                .first()
+            )
+            if _paper_capacity_left(locked) <= 0 and (existing is None or existing.deleted_at is not None):
                 raise api_error(
                     "PAPER_LIMIT_EXCEEDED",
                     details={"limit": _limits()["PAPERS_PER_PROJECT_MAX"]},
                 )
 
             if existing is not None:
-                # 同项目同内容：返回既有文献，成功码仍是 201，不改其元数据 / 纳入状态。
+                # 同项目同内容返回既有文献，成功码仍是 201；已删除时恢复纳入。
                 # 本次上传的文件没有任何引用，立即清理，不留给日后清扫兜底。
                 discard_staged(staged)
                 staged = None
                 reused = True
                 paper = existing
+                _restore_paper(locked, paper)
             else:
                 asset = commit_asset(locked, staged, FileAsset.PURPOSE_ORIGINAL_PDF)
                 staged = None  # 已归档，不能再当临时文件清理
@@ -375,9 +377,12 @@ def update_paper(
             {"fields": {name: ["未提供可修改字段"] for name in editable}},
         )
 
+    original = _require_owned_paper(actor, paper_id)
     with transaction.atomic():
+        project = lock_project(original.project_id, owner=actor.user)
         paper = _require_owned_paper(actor, paper_id, lock=True)
-        project = lock_project(paper.project_id, owner=actor.user)
+        if paper.deleted_at is not None:
+            raise api_error("NOT_FOUND")
         # 活跃任务期间不接受元数据 / 纳入状态修改（契约：409 PROJECT_BUSY）
         require_project_idle(project)
 
@@ -422,15 +427,45 @@ def update_paper(
         return paper
 
 
+def delete_paper(actor: ActorContext, paper_id: Any, expected_version: int) -> dict[str, Any]:
+    """从当前账本移除；历史快照、证据和文件保持可读。"""
+    original = _require_owned_paper(actor, paper_id)
+    with transaction.atomic():
+        project = lock_project(original.project_id, owner=actor.user)
+        paper = _require_owned_paper(actor, paper_id, lock=True)
+        require_project_idle(project)
+        if paper.deleted_at is None:
+            if int(paper.version) != int(expected_version):
+                raise api_error("VERSION_CONFLICT", details={"current_version": paper.version})
+            paper.deleted_at = timezone.now()
+            paper.included = False
+            paper.version += 1
+            paper.save(update_fields=["deleted_at", "included", "version", "updated_at"])
+            project.corpus_revision += 1
+            project.save(update_fields=["corpus_revision", "updated_at"])
+        # 丢失响应后重发不再次递增。若已经重新上传恢复，旧版本不能再次删除。
+        return {"paper_id": str(paper.id), "deleted": True, "corpus_revision": project.corpus_revision}
+
+
+def _restore_paper(project: Any, paper: Paper) -> None:
+    """调用方持 Project 锁；新上传 / 新导入恢复同内容的已删除记录。"""
+    if paper.deleted_at is None:
+        return
+    if _paper_capacity_left(project) <= 0:
+        raise api_error("PAPER_LIMIT_EXCEEDED", details={"limit": _limits()["PAPERS_PER_PROJECT_MAX"]})
+    paper.deleted_at = None
+    paper.included = True
+    paper.version += 1
+    paper.save(update_fields=["deleted_at", "included", "version", "updated_at"])
+    project.corpus_revision += 1
+    project.save(update_fields=["corpus_revision", "updated_at"])
+
+
 def _clean_authors(raw: Any) -> list[str]:
     if raw is None:
-        raise api_error(
-            "VALIDATION_ERROR", "authors 不能为 null", {"fields": {"authors": ["必须是数组"]}}
-        )
+        raise api_error("VALIDATION_ERROR", "authors 不能为 null", {"fields": {"authors": ["必须是数组"]}})
     if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
-        raise api_error(
-            "VALIDATION_ERROR", "authors 必须是数组", {"fields": {"authors": ["必须是数组"]}}
-        )
+        raise api_error("VALIDATION_ERROR", "authors 必须是数组", {"fields": {"authors": ["必须是数组"]}})
     cleaned: list[str] = []
     for item in raw:
         text = str(item).replace("\x00", "").strip()
@@ -448,9 +483,7 @@ def _clean_authors(raw: Any) -> list[str]:
             )
         cleaned.append(text)
     if len(cleaned) != len(set(cleaned)):
-        raise api_error(
-            "VALIDATION_ERROR", "authors 存在重复项", {"fields": {"authors": ["存在重复项"]}}
-        )
+        raise api_error("VALIDATION_ERROR", "authors 存在重复项", {"fields": {"authors": ["存在重复项"]}})
     return cleaned
 
 
@@ -534,9 +567,7 @@ def _load_items(job: Job) -> list[dict[str, Any]]:
     if _has_progress(current):
         return current
 
-    items = [
-        dict(item) for item in (job.frozen_input or {}).get("items", []) if isinstance(item, Mapping)
-    ]
+    items = [dict(item) for item in (job.frozen_input or {}).get("items", []) if isinstance(item, Mapping)]
     ancestor_items = _nearest_ancestor_items(job)
     if not ancestor_items:
         return items
@@ -570,10 +601,7 @@ def _has_progress(items: list[dict[str, Any]]) -> bool:
     只含 pending 且没有 resolved_source_id 的账本等于没跑过，
     不能拿它当作有效进度去覆盖更早尝试的真实结果。
     """
-    return any(
-        item.get("status") != ITEM_STATUS_PENDING or item.get("resolved_source_id")
-        for item in items
-    )
+    return any(item.get("status") != ITEM_STATUS_PENDING or item.get("resolved_source_id") for item in items)
 
 
 def _nearest_ancestor_items(job: Job) -> dict[str, dict[str, Any]]:
@@ -593,11 +621,7 @@ def _nearest_ancestor_items(job: Job) -> dict[str, dict[str, Any]]:
         seen.add(parent.pk)
         for entries in (_result_items(parent), _frozen_items(parent)):
             if _has_progress(entries):
-                return {
-                    str(item["requested_id"]): item
-                    for item in entries
-                    if item.get("requested_id")
-                }
+                return {str(item["requested_id"]): item for item in entries if item.get("requested_id")}
         current = parent
     return {}
 
@@ -645,9 +669,7 @@ def _lease_writable(context: Any, *, allow_cancelling: bool) -> bool:
 
     with transaction.atomic():
         current = (
-            Job.objects.select_for_update()
-            .filter(pk=context.job_id, project_id=context.project_id)
-            .first()
+            Job.objects.select_for_update().filter(pk=context.job_id, project_id=context.project_id).first()
         )
         if current is None:
             return False
@@ -834,9 +856,7 @@ def _record_item_error(item: dict[str, Any], exc: Exception) -> None:
         item["error"] = _job_error("INTERNAL_ERROR", "该项导入失败", retryable=True)
 
 
-def _import_one_item(
-    context: Any, job: Job, items: list[dict[str, Any]], item: dict[str, Any]
-) -> bool:
+def _import_one_item(context: Any, job: Job, items: list[dict[str, Any]], item: dict[str, Any]) -> bool:
     """处理单个导入项，返回是否真正处理完成（未完成 = 取消 / 租约失效）。
 
     `item` 必须是 `items` 里的同一个对象：中途持久化时整份内存账本一起落库，
@@ -864,7 +884,7 @@ def _import_one_item(
         #    而不是被判成容量超限。真正需要新增时才拒绝。
         if _paper_capacity_left(job.project_id) <= 0:
             existing = _find_existing_paper(job.project_id, source_id=metadata.source_id)
-            if existing is not None:
+            if existing is not None and existing.deleted_at is None:
                 _mark_duplicate(item, existing)
                 return True
             # 来源不同但内容可能相同：需要拿到哈希才能判定，此时只能先下载。
@@ -872,12 +892,10 @@ def _import_one_item(
             staged_probe = None
             try:
                 staged_probe = arxiv_client.download_pdf(metadata)
-                existing = _find_existing_paper(
-                    job.project_id, file_sha256=staged_probe.sha256
-                )
+                existing = _find_existing_paper(job.project_id, file_sha256=staged_probe.sha256)
             finally:
                 discard_staged(staged_probe)
-            if existing is not None:
+            if existing is not None and existing.deleted_at is None:
                 _mark_duplicate(item, existing)
                 return True
             raise api_error(
@@ -905,6 +923,7 @@ def _import_one_item(
                     existing = _find_existing_paper(locked.pk, source_id=metadata.source_id)
 
                 if existing is not None:
+                    _restore_paper(locked, existing)
                     _mark_duplicate(item, existing)
                     discard_staged(staged)
                     staged = None
@@ -916,9 +935,7 @@ def _import_one_item(
                         details={"limit": _limits()["PAPERS_PER_PROJECT_MAX"]},
                     )
 
-                asset = commit_asset(
-                    locked, staged, FileAsset.PURPOSE_ORIGINAL_PDF, source_job=job
-                )
+                asset = commit_asset(locked, staged, FileAsset.PURPOSE_ORIGINAL_PDF, source_job=job)
                 staged = None
                 paper = Paper.objects.create(
                     project=locked,

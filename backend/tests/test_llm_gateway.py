@@ -465,3 +465,111 @@ def test_corrupt_cached_asset_is_not_reused(context, request_data):
 def test_direct_mock_is_unavailable_in_real_mode(request_data, real_mode):
     with pytest.raises(ApiError):
         client.call_structured_mock(request_data, "query_expand_ok")
+
+
+def test_reentry_keeps_logical_attempt_limit(context, request_data, real_mode, transport, settings):
+    request_data = replace(request_data, logical_call_id=uuid.uuid4())
+    factory = transport(
+        lambda req: httpx.Response(
+            429,
+            headers={"Retry-After": str(settings.LLM_REQUEST_TIMEOUT_SECONDS + 1)},
+        )
+    )
+    for attempt in range(1, 4):
+        with pytest.raises(ApiError) as error:
+            client.call_structured(context, request_data)
+        assert error.value.code == "MODEL_RATE_LIMITED"
+        assert ModelCall.objects.count() == attempt
+    with pytest.raises(ApiError) as error:
+        client.call_structured(context, request_data)
+    assert error.value.code == "INVALID_JOB_STATE" and not error.value.retryable
+    assert factory.call_count == 3
+    assert list(ModelCall.objects.order_by("network_attempt").values_list("network_attempt", flat=True)) == [
+        1,
+        2,
+        3,
+    ]
+
+
+def test_resume_keeps_unknown_cost_and_waits_for_slot(context, request_data, real_mode, transport, settings):
+    from datetime import timedelta
+
+    settings.LLM_MAX_CONCURRENCY = 1
+    request_data = replace(request_data, logical_call_id=uuid.uuid4())
+
+    def timeout(_request):
+        raise httpx.ReadTimeout("mock timeout")
+
+    first_factory = transport(timeout)
+    with pytest.raises(ApiError):
+        client.call_structured(context, request_data)
+    original = ModelCall.objects.get()
+    reserved = UsageBudget.objects.get().reserved_usd
+    assert original.outcome == "unsettled" and reserved > 0
+    with pytest.raises(ApiError) as error:
+        client.call_structured(context, request_data)
+    assert error.value.code == "MODEL_RATE_LIMITED" and first_factory.call_count == 1
+    assert ModelCall.objects.count() == 1 and UsageBudget.objects.get().reserved_usd == reserved
+    ModelCall.objects.filter(pk=original.pk).update(slot_expires_at=timezone.now() - timedelta(seconds=1))
+    resumed_factory = transport(lambda req: httpx.Response(200, json=response()))
+    result = client.call_structured(context, request_data)
+    original.refresh_from_db()
+    assert ModelCall.objects.get(pk=result.call_id).network_attempt == 2 and resumed_factory.call_count == 1
+    assert original.outcome == "unsettled" and original.estimated_cost_usd is None
+    assert UsageBudget.objects.get().reserved_usd == reserved
+
+
+def test_logical_identity_cannot_change_request(context, request_data, real_mode, transport, settings):
+    request_data = replace(request_data, logical_call_id=uuid.uuid4())
+    factory = transport(
+        lambda req: httpx.Response(
+            429,
+            headers={"Retry-After": str(settings.LLM_REQUEST_TIMEOUT_SECONDS + 1)},
+        )
+    )
+    with pytest.raises(ApiError):
+        client.call_structured(context, request_data)
+    changed = replace(request_data, payload={**request_data.payload, "current_query": "different query"})
+    with pytest.raises(ApiError) as error:
+        client.call_structured(context, changed)
+    assert error.value.code == "INVALID_JOB_STATE"
+    assert factory.call_count == ModelCall.objects.count() == 1
+
+
+@pytest.mark.parametrize("valid_repair", [True, False])
+def test_format_repair_resumes_once_after_interruption(
+    context,
+    request_data,
+    real_mode,
+    transport,
+    monkeypatch,
+    valid_repair,
+):
+    request_data = replace(request_data, logical_call_id=uuid.uuid4())
+    bodies = []
+    answers = [response({"unexpected": True}), response() if valid_repair else response({"unexpected": True})]
+
+    def provider(request):
+        bodies.append(json.loads(request.content))
+        return httpx.Response(200, json=answers.pop(0))
+
+    transport(provider)
+    monkeypatch.setattr(client, "_pause", Mock(side_effect=ApiError("INVALID_JOB_STATE", "模拟执行中断")))
+    with pytest.raises(ApiError):
+        client.call_structured(context, request_data)
+    assert ModelCall.objects.count() == 1
+    monkeypatch.setattr(client, "_pause", Mock())
+    if valid_repair:
+        result = client.call_structured(context, request_data)
+        assert result.payload == {"queries": ["attention"]}
+        assert client.call_structured(context, request_data).call_id == result.call_id
+    else:
+        for _ in range(2):
+            with pytest.raises(ApiError) as error:
+                client.call_structured(context, request_data)
+            assert error.value.code == "MODEL_OUTPUT_INVALID"
+    assert len(bodies) == 2 and ModelCall.objects.count() == 2
+    assert bodies[-1]["messages"][-1]["content"] == client.FORMAT_REPAIR_MESSAGE
+    assert list(
+        ModelCall.objects.order_by("network_attempt").values_list("model_snapshot__format_repair", flat=True)
+    ) == [False, True]

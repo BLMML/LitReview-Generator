@@ -32,6 +32,9 @@ logs/
 .idea/
 .DS_Store
 
-# 前端依赖（镜像构建只复制 backend/ 与契约目录）
-node_modules/
+# 前端依赖与检查产物（镜像使用锁文件重新安装、构建）
+**/node_modules/
 frontend/dist/
+frontend/test-results/
+frontend/playwright-report/
+.agents/

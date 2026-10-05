@@ -24,7 +24,7 @@ from apps.projects.models import Project
 
 def list_owned_projects(actor: ActorContext) -> QuerySet[Project]:
     """只返回当前用户拥有的项目；排序稳定（created_at DESC, id DESC）。"""
-    return Project.objects.filter(owner=actor.user).order_by("-created_at", "-id")
+    return Project.objects.filter(owner=actor.user, deleted_at__isnull=True).order_by("-created_at", "-id")
 
 
 def annotate_runtime_pointers(queryset: QuerySet[Project]) -> QuerySet[Project]:
@@ -37,9 +37,8 @@ def annotate_runtime_pointers(queryset: QuerySet[Project]) -> QuerySet[Project]:
     job = apps.get_model("jobs", "Job")
 
     latest_run = analysis_run.objects.filter(project=OuterRef("pk")).order_by("-created_at", "-id")
-    active_job = (
-        job.objects.filter(project=OuterRef("pk"), status__in=ACTIVE_JOB_STATUSES)
-        .order_by("-created_at", "-id")
+    active_job = job.objects.filter(project=OuterRef("pk"), status__in=ACTIVE_JOB_STATUSES).order_by(
+        "-created_at", "-id"
     )
     return queryset.annotate(
         latest_run_id=Subquery(latest_run.values("id")[:1]),
@@ -51,7 +50,7 @@ def get_owned_project(actor: ActorContext, project_id: Any) -> Project:
     """按所有者定位项目；不存在或无权访问一律 404。"""
     project = (
         annotate_runtime_pointers(Project.objects.all())
-        .filter(pk=project_id, owner=actor.user)
+        .filter(pk=project_id, owner=actor.user, deleted_at__isnull=True)
         .first()
     )
     if project is None:

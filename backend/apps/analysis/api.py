@@ -30,6 +30,7 @@ from apps.common.http import (
 )
 from apps.common.idempotency import parse_idempotency_key
 from apps.jobs.models import JOB_KIND_ANALYZE, Job
+from apps.projects.selectors import get_owned_project
 
 
 class RunPaperSerializer(serializers.Serializer):
@@ -65,9 +66,7 @@ class RunSerializer(serializers.Serializer):
 
     def get_job_id(self, obj: AnalysisRun) -> str | None:
         job = (
-            Job.objects.filter(
-                resource_type="analysis_run", resource_id=obj.id, kind=JOB_KIND_ANALYZE
-            )
+            Job.objects.filter(resource_type="analysis_run", resource_id=obj.id, kind=JOB_KIND_ANALYZE)
             .order_by("-attempt")
             .first()
         )
@@ -134,18 +133,58 @@ class DisputeSerializer(serializers.Serializer):
 
 
 class PaperAnalysisSerializer(serializers.Serializer):
+    """PaperAnalysis DTO（`03` 第 2.3 节、`02` 第 152 行）。
+
+    **八个分析字段必须展平在顶层**，不能嵌在 `payload` 里；`generation_snapshot`
+    与 `created_at` 是内部产物，不出现在响应中。
+    冻结 OpenAPI 的 `additionalProperties: false` 会拒绝任何多余或嵌套字段——
+    HTTP 200 本身不能证明契约通过，必须按 schema 校验。
+    """
+
     id = serializers.UUIDField()
     run_id = serializers.SerializerMethodField()
     paper_id = serializers.SerializerMethodField()
-    payload = serializers.JSONField()
-    generation_snapshot = serializers.JSONField()
-    created_at = serializers.DateTimeField()
+    research_question = serializers.SerializerMethodField()
+    research_object = serializers.SerializerMethodField()
+    methods = serializers.SerializerMethodField()
+    datasets = serializers.SerializerMethodField()
+    metrics = serializers.SerializerMethodField()
+    conclusions = serializers.SerializerMethodField()
+    limitations = serializers.SerializerMethodField()
+    summary = serializers.SerializerMethodField()
 
     def get_run_id(self, obj: PaperAnalysis) -> str:
         return str(obj.run_paper.run_id)
 
     def get_paper_id(self, obj: PaperAnalysis) -> str:
         return str(obj.run_paper.paper_id)
+
+    def _field(self, obj: PaperAnalysis, name: str) -> Any:
+        return (obj.payload or {}).get(name)
+
+    def get_research_question(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "research_question")
+
+    def get_research_object(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "research_object")
+
+    def get_methods(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "methods")
+
+    def get_datasets(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "datasets")
+
+    def get_metrics(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "metrics")
+
+    def get_conclusions(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "conclusions")
+
+    def get_limitations(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "limitations")
+
+    def get_summary(self, obj: PaperAnalysis) -> Any:
+        return self._field(obj, "summary")
 
 
 class DisputePatchSerializer(StrictSerializer):
@@ -158,7 +197,7 @@ def _owned_run(actor: Any, run_id: Any) -> AnalysisRun:
     run = (
         AnalysisRun.objects.select_related("project")
         .prefetch_related("run_papers")
-        .filter(pk=run_id, project__owner=actor.user)
+        .filter(pk=run_id, project__owner=actor.user, project__deleted_at__isnull=True)
         .first()
     )
     if run is None:
@@ -177,10 +216,11 @@ def project_runs(request: Any, project_id: Any) -> Response:
     actor = require_actor(request)
     if request.method == "GET":
         reject_unknown_query_params(request, {"page", "page_size"})
+        get_owned_project(actor, project_id)
         queryset = (
             AnalysisRun.objects.select_related("project")
             .prefetch_related("run_papers")
-            .filter(project_id=project_id, project__owner=actor.user)
+            .filter(project_id=project_id, project__owner=actor.user, project__deleted_at__isnull=True)
         )
         paginator = EnvelopePagination()
         page = paginator.paginate_queryset(queryset.order_by("-created_at", "-id"), request)
@@ -249,9 +289,7 @@ def dispute_detail(request: Any, dispute_id: Any) -> Response:
     serializer = DisputePatchSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     validated = serializer.validated_data
-    changes = {
-        key: validated[key] for key in ("review_status", "review_note") if key in validated
-    }
+    changes = {key: validated[key] for key in ("review_status", "review_note") if key in validated}
     dispute = review_dispute(actor, dispute_id, validated["expected_version"], changes)
     return success(DisputeSerializer(dispute).data, request=request)
 
@@ -297,11 +335,12 @@ def paper_evidence_list(request: Any, run_id: Any, paper_id: Any) -> Response:
                 {"page_number": [f"必须在 1—{run_paper.page_count} 之间"]},
             )
 
-    from apps.parsing.evidence import list_evidence_for_run_paper
+    from apps.parsing.evidence import list_evidence_dtos
 
-    queryset = list_evidence_for_run_paper(run_paper, page_number=page_number)
+    # 直接分页 DTO 列表：模型实例不是 JSON 可序列化对象，交给渲染层会抛 TypeError
+    items = list_evidence_dtos(run_paper, page_number=page_number)
     paginator = EnvelopePagination()
-    page = paginator.paginate_queryset(queryset, request)
+    page = paginator.paginate_queryset(items, request)
     return paginator.get_paginated_response(page)
 
 

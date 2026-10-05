@@ -39,6 +39,7 @@ from apps.jobs.services import (
     dispatch,
     execution_heartbeat,
     fail_job,
+    finalize_export_status,
     mark_cancelled,
 )
 
@@ -171,6 +172,7 @@ def reconcile_jobs() -> dict[str, int]:
                     "details": {},
                     "retryable": True,
                 }
+                finalize_export_status(locked, locked.status, locked.error)
                 locked.finished_at = timezone.now()
                 locked.lease_expires_at = None
                 locked.save(

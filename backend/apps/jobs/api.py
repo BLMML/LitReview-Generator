@@ -31,6 +31,7 @@ from apps.common.http import (
 from apps.common.idempotency import parse_idempotency_key
 from apps.jobs.models import JOB_KIND_RESOURCE_TYPE, Job
 from apps.jobs.services import cancel_job, retry_job
+from apps.projects.selectors import get_owned_project
 
 ZERO = Decimal("0")
 
@@ -88,7 +89,11 @@ class JobSerializer(serializers.Serializer):
 def get_job(request: Any, job_id: Any) -> Response:
     """GET /jobs/{job_id}。"""
     actor = require_actor(request)
-    job = Job.objects.select_related("project").filter(pk=job_id, project__owner=actor.user).first()
+    job = (
+        Job.objects.select_related("project")
+        .filter(pk=job_id, project__owner=actor.user, project__deleted_at__isnull=True)
+        .first()
+    )
     if job is None:
         from apps.common.http import api_error
 
@@ -118,13 +123,16 @@ def project_jobs(request: Any, project_id: Any) -> Response:
     """GET /projects/{project_id}/jobs，含已完成 / 失败导入任务。"""
     actor = require_actor(request)
     reject_unknown_query_params(request, {"page", "page_size", "kind"})
+    get_owned_project(actor, project_id)
     kind = request.query_params.get("kind")
     if kind is not None and kind not in JOB_KIND_RESOURCE_TYPE:
         from apps.common.http import api_error
 
         raise api_error("VALIDATION_ERROR", "不支持的 kind 过滤值", {"kind": ["取值不在枚举内"]})
 
-    queryset = Job.objects.select_related("project").filter(project__owner=actor.user)
+    queryset = Job.objects.select_related("project").filter(
+        project__owner=actor.user, project__deleted_at__isnull=True
+    )
     queryset = queryset.filter(project_id=project_id)
     if kind:
         queryset = queryset.filter(kind=kind)

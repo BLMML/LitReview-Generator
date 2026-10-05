@@ -411,8 +411,10 @@ def exception_handler(exc: Exception, context: Mapping[str, Any]) -> Response | 
 
     if isinstance(exc, drf_exceptions.APIException):
         code = "NOT_FOUND" if exc.status_code == 404 else "VALIDATION_ERROR"
+        # 这里必须直接构造 ApiError：`api_error()` 辅助函数没有 status_code 参数，
+        # 传给它会在**异常处理器内部**抛 TypeError，把本该是标准 envelope 的响应变成 500。
         return error_response(
-            api_error(code, str(exc.detail), status_code=exc.status_code), request=request
+            ApiError(code, str(exc.detail), status_code=exc.status_code), request=request
         )
 
     logger.exception("未处理的服务器异常", extra={"request_id": request_id_of(request)})

@@ -1,11 +1,11 @@
-"""literature.api：文献列表、上传、arXiv 导入、详情、PATCH 与授权 PDF 下载。
+"""literature.api：文献列表、上传、arXiv 导入、详情、PATCH、DELETE 与授权 PDF 下载。
 
 职责（docs/mvp/01 第 4.2 节、docs/mvp/03 第 2.2 节）：
 - 上传受理遵循 docs/mvp/03 的幂等语义；
 - `download_paper_file` 验证 Paper → Project → owner 后输出二进制；
 - 相同项目 SHA256 重复上传返回既有 Paper（201 + X-Resource-Reused:true）。
 
-**骨架状态**：只读接口已接好查询，写接口与 arXiv 导入调用尚未实现的服务。
+删除只移出当前账本，历史引用仍可通过归属校验读取原文。
 """
 
 from __future__ import annotations
@@ -37,6 +37,7 @@ from apps.common.storage import open_asset
 from apps.literature.models import Paper
 from apps.literature.services import (
     PDF_MEDIA_TYPE,
+    delete_paper,
     import_arxiv,
     update_paper,
     upload_pdf,
@@ -92,6 +93,10 @@ class ArxivImportSerializer(StrictSerializer):
     arxiv_ids = serializers.ListField(child=serializers.CharField(), allow_empty=False)
 
 
+class PaperDeleteSerializer(StrictSerializer):
+    expected_version = serializers.IntegerField(min_value=1)
+
+
 @api_view(["GET"])
 def project_papers(request: Any, project_id: Any) -> Response:
     """GET /projects/{project_id}/papers。
@@ -102,10 +107,12 @@ def project_papers(request: Any, project_id: Any) -> Response:
     """
     actor = require_actor(request)
     reject_unknown_query_params(request, {"page", "page_size", "included"})
-    if not Project.objects.filter(pk=project_id, owner=actor.user).exists():
+    if not Project.objects.filter(pk=project_id, owner=actor.user, deleted_at__isnull=True).exists():
         raise api_error("NOT_FOUND")
 
-    queryset = Paper.objects.select_related("project", "file_asset").filter(project_id=project_id)
+    queryset = Paper.objects.select_related("project", "file_asset").filter(
+        project_id=project_id, deleted_at__isnull=True
+    )
     included = request.query_params.get("included")
     if included is not None:
         if included.lower() not in {"true", "false"}:
@@ -139,7 +146,7 @@ def paper_upload(request: Any, project_id: Any) -> Response:
     # 否则用户之后的编辑会污染重放结果
     response = success(result.data, request=request, status_code=201)
     if result.reused:
-        # 复用既有文献：不改其元数据与纳入状态，只提示前端这是同一份文件
+        # 复用同一记录；已删除时由服务恢复纳入，仍保留原元数据和文件。
         response["X-Resource-Reused"] = "true"
     return response
 
@@ -155,13 +162,13 @@ def arxiv_import(request: Any, project_id: Any) -> Response:
     return success(accepted.as_dto(), request=request, status_code=202)
 
 
-@api_view(["GET", "PATCH"])
+@api_view(["GET", "PATCH", "DELETE"])
 def paper_detail(request: Any, paper_id: Any) -> Response:
-    """GET /papers/{paper_id} 与 PATCH /papers/{paper_id}。"""
+    """GET / PATCH / DELETE；历史详情可读，写操作交给服务检查版本与空闲。"""
     actor = require_actor(request)
     paper = (
         Paper.objects.select_related("project", "file_asset")
-        .filter(pk=paper_id, project__owner=actor.user)
+        .filter(pk=paper_id, project__owner=actor.user, project__deleted_at__isnull=True)
         .first()
     )
     if paper is None:
@@ -170,14 +177,18 @@ def paper_detail(request: Any, paper_id: Any) -> Response:
     if request.method == "GET":
         return success(PaperSerializer(paper).data, request=request)
 
+    if request.method == "DELETE":
+        serializer = PaperDeleteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        return success(
+            delete_paper(actor, paper_id, serializer.validated_data["expected_version"]),
+            request=request,
+        )
+
     serializer = PaperPatchSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     validated = serializer.validated_data
-    changes = {
-        key: validated[key]
-        for key in ("title", "authors", "year", "included")
-        if key in validated
-    }
+    changes = {key: validated[key] for key in ("title", "authors", "year", "included") if key in validated}
     updated = update_paper(actor, paper_id, validated["expected_version"], changes)
     return success(PaperSerializer(updated).data, request=request)
 
@@ -208,7 +219,7 @@ def download_paper_file(request: Any, paper_id: Any) -> Response | FileResponse:
     actor = require_actor(request)
     paper = (
         Paper.objects.select_related("project", "file_asset")
-        .filter(pk=paper_id, project__owner=actor.user)
+        .filter(pk=paper_id, project__owner=actor.user, project__deleted_at__isnull=True)
         .first()
     )
     if paper is None:

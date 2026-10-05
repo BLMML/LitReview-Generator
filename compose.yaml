@@ -93,9 +93,9 @@ services:
       - --access-logfile
       - "-"
     environment: *backend-environment
-    # 前端与 nginx 尚未创建，先只绑定回环地址，不暴露到局域网
-    ports:
-      - "127.0.0.1:8000:8000"
+    # Django 仅在容器网络内，由 frontend 提供同域 /api。
+    expose:
+      - "8000"
     depends_on: *backend-depends
 
   worker:
@@ -119,11 +119,17 @@ services:
     environment: *backend-environment
     depends_on: *backend-depends
 
-  # 前端服务尚未创建：本次骨架只交付 Django 后端。
-  # frontend/ 与 deploy/frontend.Dockerfile、deploy/nginx.conf 落地后：
-  #   1. 在此增加一个同域反向代理服务（静态资源 + /api 转发）；
-  #   2. 把 web 的 ports 改为仅容器内可达，不要继续直接暴露；
-  #   3. 把 DJANGO_SECURE_COOKIES 改为 true（或删掉让 settings 自动取 true）。
+  frontend:
+    build:
+      context: .
+      dockerfile: deploy/frontend.Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:80"
+    depends_on:
+      web:
+        condition: service_started
+    # 本地 HTTP 入口；生产接入 TLS 后同步启用 Secure Cookie。
 
 volumes:
   pgdata:

@@ -9,9 +9,8 @@
 约定：所有业务页码为 1 起始；pypdfium2 渲染放在受限 worker 进程中，
 不在 Web 请求线程中批量渲染。
 
-**阶段状态**：PDF 结构检查（大小 / 页数 / 加密 / 损坏）已随 M05「文献接入」实现，
-供 `literature.services.upload_pdf` 在上传时校验；文本提取与页面渲染属于 M06 解析阶段，
-仍为未实现。
+**阶段状态**：PDF 结构检查（大小 / 页数 / 加密 / 损坏）随 M05「文献接入」实现；
+M06 补齐文本提取与受控页面渲染，供 `parsing.services` 组织解析。
 
 这也是 `01` 第 4.2 节「上传时先暂存并检查格式、体积、页数、加密和哈希」要求的落点：
 PDF 解析只在 parsing 模块里做，literature 不另建一套 PDF 读取实现。
@@ -116,10 +115,160 @@ def inspect_pdf(asset: Any) -> PdfInspection:
 
 
 def extract_pages(asset: Any) -> list[PageText]:
-    """按页提取文本；检查空白与异常结果，定位需要图像辅助的页。"""
-    raise api_error("SERVICE_UNAVAILABLE", NOT_IMPLEMENTED_MESSAGE, retryable=False)
+    """按页提取文本；标记空白 / 异常页供上层决定是否走图像辅助。
+
+    只做**文本层**读取，不做任何语义判断，也不补造内容：
+    提取为空的页会被标记 `is_empty=True`，由 `parsing.services` 决定用 DeepSeek 图像能力
+    转录，或如实失败。提取成功不等于语义识别正确（`01` 第 4.3 节）。
+    """
+    import pypdf
+    from pypdf.errors import PdfReadError
+
+    path = _asset_path(asset)
+    pages: list[PageText] = []
+    try:
+        with path.open("rb") as handle:
+            reader = pypdf.PdfReader(handle, strict=False)
+            if reader.is_encrypted:
+                raise api_error("UNSUPPORTED_PDF", "不接受加密 PDF")
+            for index, page in enumerate(reader.pages, start=1):
+                try:
+                    raw = page.extract_text() or ""
+                except Exception:  # noqa: BLE001 - 单页提取失败只影响该页
+                    # 单页损坏不能让整篇静默跳过：留空并标记为需图像辅助
+                    raw = ""
+                text = _normalize_text(raw)
+                pages.append(PageText(page_number=index, text=text, is_empty=not text.strip()))
+    except ApiError:
+        raise
+    except (PdfReadError, OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        raise api_error("PDF_PARSE_FAILED", "PDF 已损坏或无法解析") from exc
+
+    if not pages:
+        raise api_error("PDF_PARSE_FAILED", "PDF 没有任何可解析的页面")
+    return pages
 
 
-def render_page(asset: Any, page_number: int) -> Any:
-    """渲染单页为图像资产；page_number 为 1 起始。"""
-    raise api_error("SERVICE_UNAVAILABLE", NOT_IMPLEMENTED_MESSAGE, retryable=False)
+def _normalize_text(raw: str) -> str:
+    r"""归一化页文本：统一换行、去掉零宽字符与行尾空白，保留段落结构。
+
+    不改写文字本身（不纠正错别字、不做全半角转换），因为证据必须能与原文核对。
+    """
+    text = raw.replace("\r\n", "\n").replace("\r", "\n")
+    text = text.replace("\x00", "").replace("\u200b", "").replace("\ufeff", "")
+    lines = [line.rstrip() for line in text.split("\n")]
+    # 折叠三个以上连续空行为一个空行，保留段落边界
+    collapsed: list[str] = []
+    blank_run = 0
+    for line in lines:
+        if line:
+            blank_run = 0
+            collapsed.append(line)
+            continue
+        blank_run += 1
+        if blank_run <= 1:
+            collapsed.append("")
+    return "\n".join(collapsed).strip()
+
+
+def _asset_path(asset: Any) -> Path:
+    from apps.common.storage import resolve_storage_key
+
+    if isinstance(asset, (str, Path)):
+        return Path(asset)
+    if asset is None:
+        raise api_error("NOT_FOUND", "文件不存在或不可读")
+    return resolve_storage_key(asset.storage_key)
+
+
+def render_page(
+    asset: Any, page_number: int, *, scale: float | None = None, max_bytes: int | None = None
+) -> bytes:
+    """把单页渲染为 PNG 字节；`page_number` 为 1 起始。
+
+    受控渲染：限制渲染倍率与输出体积，超过图像上限直接报错，
+    不返回被缩放到看不清关键文字的图（`04` 第 6.2 节）。
+
+    `pypdfium2` 是唯一渲染实现；本项目未安装 Pillow，因此直接编码 PNG，
+    不经过 PIL，避免为渲染引入新的图像库依赖。
+    """
+    import pypdfium2
+
+    if not isinstance(page_number, int) or page_number < 1:
+        raise api_error("VALIDATION_ERROR", "page_number 必须是 1 起始的整数")
+
+    path = _asset_path(asset)
+    scale = float(settings.PAGE_RENDER_SCALE if scale is None else scale)
+    max_bytes = int(settings.PAGE_IMAGE_MAX_BYTES if max_bytes is None else max_bytes)
+
+    document = None
+    try:
+        document = pypdfium2.PdfDocument(str(path))
+        if page_number > len(document):
+            raise api_error(
+                "VALIDATION_ERROR",
+                "page_number 超出该 PDF 真实页数",
+                {"page_number": [f"必须在 1—{len(document)} 之间"]},
+            )
+        bitmap = document[page_number - 1].render(scale=scale)
+        payload = _encode_png(bitmap)
+    except ApiError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - 渲染失败必须显式失败，不补造内容
+        raise api_error("PDF_PARSE_FAILED", f"第 {page_number} 页渲染失败") from exc
+    finally:
+        if document is not None:
+            document.close()
+
+    if len(payload) > max_bytes:
+        raise api_error(
+            "PDF_PARSE_FAILED",
+            "渲染图像超过单页体积上限",
+            {"page_number": page_number, "limit_bytes": max_bytes},
+        )
+    return payload
+
+
+def _encode_png(bitmap: Any) -> bytes:
+    """把 pypdfium2 位图编码为 PNG；不依赖 Pillow。
+
+    位图格式为 3 通道 BGR（`n_channels=3`），按 stride 逐行取像素后转成 RGB。
+    """
+    import struct
+    import zlib
+
+    width = int(bitmap.width)
+    height = int(bitmap.height)
+    stride = int(bitmap.stride)
+    channels = int(getattr(bitmap, "n_channels", 3))
+    if channels not in (3, 4):
+        raise api_error("PDF_PARSE_FAILED", "渲染位图通道数不支持")
+
+    raw = bytes(bitmap.buffer)
+    rows = bytearray()
+    for y in range(height):
+        start = y * stride
+        line = raw[start : start + width * channels]
+        rows.append(0)  # PNG 过滤器类型 0（None）
+        for x in range(width):
+            offset = x * channels
+            b = line[offset]
+            g = line[offset + 1]
+            r = line[offset + 2]
+            rows += bytes((r, g, b))
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        return (
+            struct.pack(">I", len(payload))
+            + tag
+            + payload
+            + struct.pack(">I", zlib.crc32(tag + payload) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)  # 8bit truecolor
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(bytes(rows), 6))
+        + chunk(b"IEND", b"")
+    )

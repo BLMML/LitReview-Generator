@@ -39,6 +39,7 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 frontend/test-results/
+frontend/playwright-report/
 
 # ── 编辑器与系统 ──────────────────────────────────────────────
 .vscode/
